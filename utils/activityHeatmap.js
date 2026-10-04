@@ -64,7 +64,7 @@ export function buildActivityGrid(submissionCalendar, options = {}) {
 }
 
 /**
- * Maps a day's submission count to an intensity level (0-4) relative to the
+ * Maps a day's submission count to an intensity level (0-3) relative to the
  * busiest day in the window. 0 means no submissions.
  * @param {number} count
  * @param {number} maxCount
@@ -79,10 +79,9 @@ export function getActivityLevel(count, maxCount) {
   }
 
   const ratio = count / maxCount;
-  if (ratio <= 0.25) return 1;
-  if (ratio <= 0.5) return 2;
-  if (ratio <= 0.75) return 3;
-  return 4;
+  if (ratio <= 1 / 3) return 1;
+  if (ratio <= 2 / 3) return 2;
+  return 3;
 }
 
 /**

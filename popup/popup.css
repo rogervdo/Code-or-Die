@@ -9,7 +9,7 @@
   --toggle-circle-color: #282c34;
   --inactive-tab-color: #a9a9a9;
   --active-tab-line-color: #fff;
-  --item-bg-color: #2c2c2e;
+  --item-bg-color: #2a2a2a;
   --item-border-color: #3a3a3c;
   --diff-color-easy: #06b8a3;
   --diff-color-medium: #ffc107;
@@ -115,6 +115,7 @@ body {
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
+  cursor: pointer;
 }
 
 .header-streak {
@@ -463,7 +464,7 @@ body {
 }
 
 .summary-solved-total {
-  font-size: 24px;
+  font-size: 13px;
   font-weight: 700;
   color: var(--heading-color);
 }
@@ -479,6 +480,7 @@ body {
 .summary-diff {
   font-size: 13px;
   font-weight: 500;
+  color: var(--inactive-tab-color);
 }
 
 .summary-diff b {
@@ -515,8 +517,9 @@ body {
 }
 
 .heatmap-count {
+  font-size: 11px;
   font-weight: 600;
-  color: var(--timestamp-color);
+  color: var(--diff-color-easy);
 }
 
 .heatmap-legend {
@@ -538,19 +541,15 @@ body {
 }
 
 .heat-level-1 {
-  background-color: #16483a;
+  background-color: #0d4f47;
 }
 
 .heat-level-2 {
-  background-color: #1f7a5a;
+  background-color: #0a8a78;
 }
 
 .heat-level-3 {
-  background-color: #2fa877;
-}
-
-.heat-level-4 {
-  background-color: #46d19a;
+  background-color: #06b8a3;
 }
 
 [data-theme='light'] .heat-cell {
@@ -558,19 +557,15 @@ body {
 }
 
 [data-theme='light'] .heat-level-1 {
-  background-color: #c6e9d8;
+  background-color: #b9ece4;
 }
 
 [data-theme='light'] .heat-level-2 {
-  background-color: #8fd6b6;
+  background-color: #62d4c4;
 }
 
 [data-theme='light'] .heat-level-3 {
-  background-color: #52bd91;
-}
-
-[data-theme='light'] .heat-level-4 {
-  background-color: #2fa877;
+  background-color: #06b8a3;
 }
 
 .heatmap-grid {
@@ -775,7 +770,7 @@ li {
 }
 
 /* Every banner is fully opaque. Non-top-3 banners use --item-bg-color
-   (#2C2C2E); the top 3 use their own solid metallic gradients. No rank badge,
+   (#2A2A2A); the top 3 use their own solid metallic gradients. No rank badge,
    no colored name, no avatar ring. */
 .stat-row.rank-1,
 .stat-row.rank-2,

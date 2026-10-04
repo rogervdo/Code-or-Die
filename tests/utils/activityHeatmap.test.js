@@ -68,13 +68,13 @@ describe('getActivityLevel', () => {
     expect(getActivityLevel(null, 10)).toBe(0);
   });
 
-  it('buckets counts into 1-4 relative to the max', () => {
+  it('buckets counts into 1-3 relative to the max', () => {
     expect(getActivityLevel(2, 10)).toBe(1);
-    expect(getActivityLevel(3, 10)).toBe(2);
-    expect(getActivityLevel(5, 10)).toBe(2);
-    expect(getActivityLevel(6, 10)).toBe(3);
-    expect(getActivityLevel(8, 10)).toBe(4);
-    expect(getActivityLevel(10, 10)).toBe(4);
+    expect(getActivityLevel(3, 10)).toBe(1);
+    expect(getActivityLevel(4, 10)).toBe(2);
+    expect(getActivityLevel(6, 10)).toBe(2);
+    expect(getActivityLevel(7, 10)).toBe(3);
+    expect(getActivityLevel(10, 10)).toBe(3);
   });
 
   it('falls back to level 1 when there is no max', () => {
