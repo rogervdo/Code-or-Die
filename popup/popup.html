@@ -3,54 +3,97 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Code or Die - Your LeetCode Social Hub</title>
+    <title>Leetcode or Die - Your LeetCode Social Hub</title>
     <link rel="stylesheet" href="popup.css" />
   </head>
   <body>
-    <div class="navbar">
-      <div class="title">Code or Die</div>
-      <div class="toggle-container">
-        <img src="../icon.png" class="icon" />
-        <img src="../cogwheel.png" class="settings-icon" id="settings-icon" title="Settings" />
-        <!-- <input type="checkbox" id="mode-toggle"> -->
-        <!-- <label for="mode-toggle" class="toggle-label"></label> -->
+    <header class="profile-bar">
+      <div class="profile-identity" id="profile-identity" hidden>
+        <img class="profile-avatar" id="self-avatar" alt="" />
+        <span class="profile-name" id="self-username"></span>
       </div>
-    </div>
+      <div class="header-streak" id="header-streak" title="Current streak">
+        <span class="header-streak-flame">🔥</span>
+        <span class="header-streak-count" id="header-streak-count">0</span>
+      </div>
+      <button class="settings-btn" id="settings-icon" type="button" title="Settings" aria-label="Settings">
+        <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <circle cx="12" cy="12" r="3"></circle>
+          <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"></path>
+        </svg>
+      </button>
+    </header>
     <div class="tab-bar">
       <button id="activity-tab" class="tab">Activity</button>
       <button id="leaderboard-tab" class="tab">Leaderboard</button>
       <button id="contest-tab" class="tab">Contest</button>
       <button id="global-rankings-tab" class="tab">Global</button>
-      <button id="strikes-tab" class="tab">Strikes</button>
+      <button id="strikes-tab" class="tab">Streaks</button>
     </div>
     <div class="content">
       <div id="username-input" class="page">
-        <h2>Please enter your username:</h2>
-        <input type="text" id="username" placeholder="Username" autocomplete="username" />
-        <button id="submit-username">Submit</button>
+        <div class="page-card">
+          <h2>Please enter your username:</h2>
+          <input type="text" id="username" placeholder="Username" autocomplete="username" />
+          <button id="submit-username">Submit</button>
+        </div>
       </div>
 
       <div id="activity" class="page">
-        <div class="page-header">
-          <h2>Activity</h2>
+        <div class="page-card summary-card" id="summary-card">
+          <div class="summary-solved">
+            <span class="summary-solved-label">Solved</span>
+            <span class="summary-solved-total" id="summary-solved-total">0</span>
+          </div>
+          <div class="summary-breakdown">
+            <span class="summary-diff easy"><b id="summary-easy">0</b> Easy</span>
+            <span class="summary-diff medium"><b id="summary-medium">0</b> Med</span>
+            <span class="summary-diff hard"><b id="summary-hard">0</b> Hard</span>
+          </div>
         </div>
-        <div class="activity-filter">
-          <input type="text" id="activity-search" placeholder="Filter by username..." />
-          <button id="activity-clear-filter" class="clear-filter-btn">✕</button>
+
+        <div class="page-card heatmap-card" id="heatmap-card">
+          <div class="heatmap-header">
+            <span class="heatmap-title">30-Day Activity</span>
+            <div class="heatmap-meta">
+              <span class="heatmap-count" id="heatmap-active-days">0/30</span>
+              <span class="heatmap-legend">
+                <span class="heatmap-legend-text">Less</span>
+                <span class="heat-cell heat-level-0"></span>
+                <span class="heat-cell heat-level-1"></span>
+                <span class="heat-cell heat-level-2"></span>
+                <span class="heat-cell heat-level-3"></span>
+                <span class="heat-cell heat-level-4"></span>
+                <span class="heatmap-legend-text">More</span>
+              </span>
+            </div>
+          </div>
+          <div class="heatmap-grid" id="heatmap-grid"></div>
+          <div class="heatmap-axis">
+            <span id="heatmap-axis-start"></span>
+            <span class="heatmap-axis-end">Today</span>
+          </div>
+          <div class="heatmap-tooltip" id="heatmap-tooltip" hidden></div>
+        </div>
+
+        <div class="page-card page-card-compact">
+          <div class="activity-filter">
+            <input type="text" id="activity-search" placeholder="Filter by username..." />
+            <button id="activity-clear-filter" class="clear-filter-btn">✕</button>
+          </div>
         </div>
         <div id="graphql-results"></div>
       </div>
 
       <div id="leaderboard" class="page">
-        <div class="page-header">
-          <h2>Leaderboard</h2>
-        </div>
-        <div class="leaderboard-tabs">
-          <button class="leaderboard-tab daily" data-difficulty="Daily">Daily</button>
-          <button class="leaderboard-tab easy" data-difficulty="Easy">Easy</button>
-          <button class="leaderboard-tab medium" data-difficulty="Medium">Medium</button>
-          <button class="leaderboard-tab hard" data-difficulty="Hard">Hard</button>
-          <button class="leaderboard-tab" data-difficulty="All">All</button>
+        <div class="page-card page-card-compact">
+          <div class="leaderboard-tabs">
+            <button class="leaderboard-tab weekly" data-difficulty="Weekly">Weekly</button>
+            <button class="leaderboard-tab easy" data-difficulty="Easy">Easy</button>
+            <button class="leaderboard-tab medium" data-difficulty="Medium">Medium</button>
+            <button class="leaderboard-tab hard" data-difficulty="Hard">Hard</button>
+            <button class="leaderboard-tab" data-difficulty="All">All</button>
+          </div>
         </div>
         <div id="leaderboard-results"></div>
         <!-- <p>Problems Solved</p>
@@ -58,37 +101,31 @@
       </div>
 
       <div id="contest" class="page">
-        <div class="page-header">
-          <h2>Contest</h2>
-        </div>
-        <p class="contest-description">Weekly competition (Mon-Sun) - Easy: 1pt, Medium: 3pt, Hard: 6pt</p>
-        <div class="contest-week-info">
-          <p id="contest-week-dates"></p>
+        <div class="page-card page-card-compact">
+          <p class="contest-description">Weekly contest · Easy 1pt · Medium 3pt · Hard 6pt</p>
+          <div class="contest-week-info">
+            <p id="contest-week-dates"></p>
+          </div>
         </div>
         <div id="contest-results"></div>
       </div>
 
       <div id="global-rankings" class="page">
-        <div class="page-header">
-          <h2>Global Rankings</h2>
-        </div>
-        <p class="global-rankings-description">Problem-solving rank among your group. Change vs your most recent saved snapshot.</p>
         <div id="global-rankings-results"></div>
       </div>
 
       <div id="strikes" class="page">
         <div class="strikes-header">
-          <div class="page-header">
-            <h2>Strikes</h2>
-          </div>
-          <button id="copy-strikes-btn" class="copy-btn" title="Copy strikes to clipboard">📋</button>
+          <button id="copy-strikes-btn" class="copy-btn" title="Copy streaks &amp; strikes to clipboard">Copy</button>
         </div>
-        <p class="strikes-description">Consecutive days users haven't solved problems (starting from yesterday)</p>
         <div id="strikes-list"></div>
       </div>
 
       <div id="settings" class="page">
-        <h2>Settings</h2>
+        <div class="page-card">
+          <h2 class="settings-brand">Leetcode or Die</h2>
+          <p class="settings-subtitle">Settings</p>
+        </div>
         <div class="settings-section">
           <h3>Friends Management</h3>
           <div class="settings-item">
@@ -136,7 +173,7 @@
               </label>
             </div>
             <div class="tab-toggle-item">
-              <span class="tab-toggle-label">Strikes</span>
+              <span class="tab-toggle-label">Streaks</span>
               <label class="toggle-switch">
                 <input type="checkbox" data-tab-key="strikes" checked />
                 <span class="toggle-slider"></span>
@@ -145,7 +182,31 @@
           </div>
         </div>
         <div class="settings-section">
-          <h3>Strikes Settings</h3>
+          <h3>Theme</h3>
+          <p class="settings-description">Color palette for the top-3 podium rows.</p>
+          <div class="settings-item">
+            <label for="rank-theme-select">Podium colors:</label>
+            <select id="rank-theme-select">
+              <option value="medal">Medals (gold / silver / bronze)</option>
+              <option value="lol">League (purple / blue / green)</option>
+            </select>
+          </div>
+          <div class="rank-theme-preview">
+            <span class="rank-preview rank-1"></span>
+            <span class="rank-preview rank-2"></span>
+            <span class="rank-preview rank-3"></span>
+          </div>
+        </div>
+        <div class="settings-section">
+          <h3>Streaks &amp; Strikes</h3>
+          <div class="settings-item">
+            <label for="strikes-streaks-select">Show in the Streaks tab:</label>
+            <select id="strikes-streaks-select">
+              <option value="both">Both strikes and streaks</option>
+              <option value="strikes">Strikes only</option>
+              <option value="streaks">Streaks only</option>
+            </select>
+          </div>
           <div class="settings-item">
             <label for="max-strikes-input">Max strikes to check:</label>
             <div class="input-group">
@@ -172,6 +233,13 @@
               <option value="Australia/Sydney">Sydney (AEDT/AEST)</option>
               <option value="UTC">UTC</option>
             </select>
+          </div>
+          <div class="settings-item settings-toggle-row">
+            <label for="copy-button-toggle">Show copy button</label>
+            <label class="toggle-switch">
+              <input type="checkbox" id="copy-button-toggle" />
+              <span class="toggle-slider"></span>
+            </label>
           </div>
         </div>
         <div class="settings-section">

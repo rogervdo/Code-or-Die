@@ -1,25 +1,35 @@
 import getUserProblemStats from '../GQLQueries/getUserProblemStats.js';
 import getUserProfilePic from '../GQLQueries/getUserProfilePic.js';
+import getUserCalendar from '../GQLQueries/getUserCalendar.js';
 import getGlobalRanking from '../GQLQueries/getGlobalRanking.js';
 import questionDifficulty from '../GQLQueries/questionDifficulty.js';
 import getACSubmissions from '../GQLQueries/recentACSubmissions.js';
-import cache, { TTL, getTTLUntilMidnight } from '../utils/cache.js';
-import { getLocalDateString, getTodayInTimezone, getUserTimezone } from '../utils/timezoneHelper.js';
-import { createUpdateTimer, getSubmissionsCacheKeys, getUserStatsCacheKeys, getGlobalRankingCacheKeys } from '../utils/updateTimer.js';
+import cache, { TTL } from '../utils/cache.js';
+import { getTodayInTimezone } from '../utils/timezoneHelper.js';
+import { createUpdateTimer, resetRefreshSchedule, startRefreshCycle } from '../utils/updateTimer.js';
+import {
+  accumulateWeeklySubmissions,
+  filterSubmissionsInWeek,
+  getCurrentWeekBounds,
+  getPointsForDifficulty,
+} from '../utils/contestUtils.js';
 import {
   displayACSubmissions,
+  displayActivityHeatmap,
   displayContestLeaderboard,
   displayFriendsList,
   displayGlobalRankings,
   displayLeaderboard,
+  displaySolvedStats,
   displayStrikesUsers,
 } from './display.js';
+import { loadStrikesUsersData } from '../utils/streakUtils.js';
+import { showAllSkeletons } from './skeleton.js';
 
-// Global timer references
-let activityTimer = null;
-let leaderboardTimer = null;
-let strikesTimer = null;
-let globalRankingsTimer = null;
+// Countdown elements shown on each tab, plus the single cycle that drives them.
+const TIMER_CONTAINERS = ['activity', 'leaderboard', 'contest', 'global-rankings', 'strikes'];
+let updateTimers = [];
+let refreshCycle = null;
 
 const TAB_CONFIG = [
   { pageId: 'activity', key: 'activity', tabId: 'activity-tab' },
@@ -106,6 +116,73 @@ async function initTabVisibilitySettings() {
   });
 
   applyTabVisibility(enabledTabs);
+}
+
+// Copy button setting: the copy button in the Streaks tab is hidden unless
+// explicitly enabled by the user.
+const DEFAULT_COPY_BUTTON_ENABLED = false;
+
+function getCopyButtonEnabled() {
+  return new Promise((resolve) => {
+    chrome.storage.local.get({ copyButtonEnabled: DEFAULT_COPY_BUTTON_ENABLED }, (result) => {
+      resolve(result.copyButtonEnabled);
+    });
+  });
+}
+
+function saveCopyButtonEnabled(enabled) {
+  return new Promise((resolve) => {
+    chrome.storage.local.set({ copyButtonEnabled: enabled }, resolve);
+  });
+}
+
+function applyCopyButtonEnabled(enabled) {
+  const strikesPage = document.getElementById('strikes');
+  if (strikesPage) {
+    strikesPage.classList.toggle('copy-btn-hidden', !enabled);
+  }
+}
+
+async function initCopyButtonSetting() {
+  const enabled = await getCopyButtonEnabled();
+  const toggle = document.getElementById('copy-button-toggle');
+  if (toggle) {
+    toggle.checked = enabled;
+  }
+  applyCopyButtonEnabled(enabled);
+}
+
+// Podium rank theme: swaps the top-3 row palette between metallic medals and a
+// League-style purple/blue/green. Applied via [data-rank-theme] on <html>.
+const DEFAULT_RANK_THEME = 'medal';
+const RANK_THEMES = ['medal', 'lol'];
+
+function getRankTheme() {
+  return new Promise((resolve) => {
+    chrome.storage.local.get({ rankTheme: DEFAULT_RANK_THEME }, (result) => {
+      resolve(result.rankTheme);
+    });
+  });
+}
+
+function saveRankTheme(theme) {
+  return new Promise((resolve) => {
+    chrome.storage.local.set({ rankTheme: theme }, resolve);
+  });
+}
+
+function applyRankTheme(theme) {
+  const value = RANK_THEMES.includes(theme) ? theme : DEFAULT_RANK_THEME;
+  document.documentElement.setAttribute('data-rank-theme', value);
+}
+
+async function initRankThemeSetting() {
+  const theme = await getRankTheme();
+  const select = document.getElementById('rank-theme-select');
+  if (select) {
+    select.value = theme;
+  }
+  applyRankTheme(theme);
 }
 
 // Legacy streak corrections for users affected before the fix was implemented
@@ -269,23 +346,26 @@ document.getElementById('submit-username').addEventListener('click', async () =>
       chrome.storage.local.set({ username: username }, async function () {
         console.log('Username is set to ' + username);
         currentUsername = username;
+        setProfileHeader(username);
+        loadSelfSummary(username);
+        showAllSkeletons();
+        showPage(getFirstEnabledPageId());
         const data = await getACSubmissions(username, 5);
         cachedActivitySubmissions = data;
         displayACSubmissions(data, username);
+        startSharedRefresh();
         showPage(getFirstEnabledPageId());
 
         // display leaderboard for first time, repeat code since DOM update already happened
-        // Load in daily leaderboard data with timezone
-        chrome.storage.local.get({ maxStrikes: 3, timezone: 'America/Chicago' }, async (result) => {
+        chrome.storage.local.get({ maxStrikes: 3, timezone: 'America/Chicago', strikesStreaksView: 'both' }, async (result) => {
           const timezone = result.timezone;
           const maxStrikes = result.maxStrikes;
 
-          // Load daily leaderboard data
-          cachedDailyData = await loadDailyLeaderboardData([], username, timezone);
-
           // Load strikes users data
+          cachedStrikesStreaksView = result.strikesStreaksView;
           document.getElementById('max-strikes-input').value = maxStrikes;
           document.getElementById('timezone-select').value = result.timezone;
+          document.getElementById('strikes-streaks-select').value = result.strikesStreaksView;
           const { strikesUsers, clearedStrikesUsers, streaksUsers } = await loadStrikesUsersData(
             [],
             username,
@@ -295,7 +375,7 @@ document.getElementById('submit-username').addEventListener('click', async () =>
           cachedStrikesData = strikesUsers;
           cachedClearedStrikesData = clearedStrikesUsers;
           cachedStreaksData = streaksUsers;
-          displayStrikesUsers(strikesUsers, clearedStrikesUsers, streaksUsers, username);
+          displayStrikesUsers(strikesUsers, clearedStrikesUsers, streaksUsers, username, cachedStrikesStreaksView);
 
           // Load contest data
           const contestResult = await loadContestData([], username, timezone);
@@ -309,9 +389,6 @@ document.getElementById('submit-username').addEventListener('click', async () =>
 
           cachedGlobalRankingsData = await loadGlobalRankingsData([], username, timezone);
           displayGlobalRankings(cachedGlobalRankingsData, username);
-
-          if (globalRankingsTimer) globalRankingsTimer.destroy();
-          globalRankingsTimer = createUpdateTimer('global-rankings', getGlobalRankingCacheKeys([username]));
 
           // Load leaderboard data
           let leaderboardData = [await getUserProblemStats(username)];
@@ -332,8 +409,8 @@ document.getElementById('submit-username').addEventListener('click', async () =>
                 leaderboardTabs.forEach((t) => t.classList.remove('active'));
                 tab.classList.add('active');
                 let difficulty = tab.getAttribute('data-difficulty');
-                const diffMap = { All: 0, Easy: 1, Medium: 2, Hard: 3, Daily: 4 };
-                displayLeaderboard(friendData, cachedDailyData, username, diffMap[difficulty]);
+                const diffMap = { All: 0, Easy: 1, Medium: 2, Hard: 3, Weekly: 4 };
+                displayLeaderboard(friendData, getWeeklyLeaderboardData(), username, diffMap[difficulty]);
               });
             });
             // load default tab as All for leaderboard
@@ -366,6 +443,8 @@ document.addEventListener('DOMContentLoaded', async function () {
   await initializeLegacyStreaks();
 
   await initTabVisibilitySettings();
+  await initCopyButtonSetting();
+  await initRankThemeSetting();
 
   // DISABLED COLOR SCHEME TOGGLE - light mode looks bad
   // document.getElementById('mode-toggle').addEventListener('change', function() {
@@ -382,12 +461,17 @@ document.addEventListener('DOMContentLoaded', async function () {
       showPage('username-input');
     } else {
       console.log('Welcome back, ' + result.username);
+      showAllSkeletons();
+      showPage(getFirstEnabledPageId());
       // load in user AC data
       let allSubmissions = [];
       const data = await getACSubmissions(result.username, 5);
       allSubmissions = allSubmissions.concat(data);
       const currUsername = result.username;
       currentUsername = currUsername;
+      setProfileHeader(currUsername);
+      loadSelfSummary(currUsername);
+      startSharedRefresh();
 
       // load in friend data
       chrome.storage.local.get({ friends: [] }, async (result) => {
@@ -405,21 +489,15 @@ document.addEventListener('DOMContentLoaded', async function () {
         // default to first enabled tab
         showPage(getFirstEnabledPageId());
 
-        // Initialize activity timer
-        const allUsers = [currUsername, ...result.friends];
-        if (activityTimer) activityTimer.destroy();
-        activityTimer = createUpdateTimer('activity', getSubmissionsCacheKeys(allUsers, 5));
-
         // Load strikes users data with stored max strikes and timezone values
-        chrome.storage.local.get({ maxStrikes: 3, timezone: 'America/Chicago' }, async (strikesResult) => {
+        chrome.storage.local.get({ maxStrikes: 3, timezone: 'America/Chicago', strikesStreaksView: 'both' }, async (strikesResult) => {
           const maxStrikes = strikesResult.maxStrikes;
           const timezone = strikesResult.timezone;
 
-          // Load in daily leaderboard data with timezone
-          cachedDailyData = await loadDailyLeaderboardData(result.friends, currUsername, timezone);
-          console.log(cachedDailyData);
+          cachedStrikesStreaksView = strikesResult.strikesStreaksView;
           document.getElementById('max-strikes-input').value = maxStrikes;
           document.getElementById('timezone-select').value = strikesResult.timezone;
+          document.getElementById('strikes-streaks-select').value = strikesResult.strikesStreaksView;
           const { strikesUsers, clearedStrikesUsers, streaksUsers } = await loadStrikesUsersData(
             result.friends,
             currUsername,
@@ -429,7 +507,7 @@ document.addEventListener('DOMContentLoaded', async function () {
           cachedStrikesData = strikesUsers;
           cachedClearedStrikesData = clearedStrikesUsers;
           cachedStreaksData = streaksUsers;
-          displayStrikesUsers(strikesUsers, clearedStrikesUsers, streaksUsers, currUsername);
+          displayStrikesUsers(strikesUsers, clearedStrikesUsers, streaksUsers, currUsername, cachedStrikesStreaksView);
 
           // Load contest data
           const contestResult = await loadContestData(result.friends, currUsername, timezone);
@@ -443,13 +521,6 @@ document.addEventListener('DOMContentLoaded', async function () {
 
           cachedGlobalRankingsData = await loadGlobalRankingsData(result.friends, currUsername, timezone);
           displayGlobalRankings(cachedGlobalRankingsData, currUsername);
-
-          if (globalRankingsTimer) globalRankingsTimer.destroy();
-          globalRankingsTimer = createUpdateTimer('global-rankings', getGlobalRankingCacheKeys(allUsers));
-
-          // Initialize strikes timer (uses submissions for 30 items)
-          if (strikesTimer) strikesTimer.destroy();
-          strikesTimer = createUpdateTimer('strikes', getSubmissionsCacheKeys(allUsers, 30));
         });
 
         // Load in friend leaderboard data
@@ -475,19 +546,14 @@ document.addEventListener('DOMContentLoaded', async function () {
                 leaderboardTabs.forEach((t) => t.classList.remove('active'));
                 tab.classList.add('active');
                 let difficulty = tab.getAttribute('data-difficulty');
-                const diffMap = { All: 0, Easy: 1, Medium: 2, Hard: 3, Daily: 4 };
-                displayLeaderboard(friendData, cachedDailyData, currUsername, diffMap[difficulty]);
+                const diffMap = { All: 0, Easy: 1, Medium: 2, Hard: 3, Weekly: 4 };
+                displayLeaderboard(friendData, getWeeklyLeaderboardData(), currUsername, diffMap[difficulty]);
               });
             });
             // load default tab as All for leaderboard
             const defaultTab = document.querySelector('.leaderboard-tab[data-difficulty="All"]');
             defaultTab.classList.add('active');
             displayLeaderboard(friendData, null, currUsername, 0);
-
-            // Initialize leaderboard timer (combines user stats and daily submissions)
-            if (leaderboardTimer) leaderboardTimer.destroy();
-            const leaderboardCacheKeys = [...getUserStatsCacheKeys(allUsers), ...getSubmissionsCacheKeys(allUsers, 20)];
-            leaderboardTimer = createUpdateTimer('leaderboard', leaderboardCacheKeys);
           });
         });
       });
@@ -496,473 +562,18 @@ document.addEventListener('DOMContentLoaded', async function () {
 });
 
 /**
- * Loads daily leaderboard data for the current user and their friends.
- * Retrieves recent submissions for the current user and their friends,
- * filters them to include only today's submissions, and sorts the users
- * based on the count of their submissions.
- * @param {string[]} friends - An array of usernames representing the friends of the current user.
- * @param {string} username - The username of the current user.
- * @param {string} timezone - IANA timezone string (e.g., "America/Chicago") or 'auto' for auto-detect
- * @returns {object[]} -An array of user objects containing daily leaderboard data.
+ * Builds the weekly leaderboard from the accumulated contest data, ranking
+ * users by how many problems they solved this week.
+ * @returns {object[]} - An array of { username, avatar, count } sorted by count.
  */
-async function loadDailyLeaderboardData(friends, username, timezone = 'America/Chicago') {
-  // Handle auto-detect timezone
-  if (timezone === 'auto') {
-    timezone = Intl.DateTimeFormat().resolvedOptions().timeZone;
-  }
-
-  let allSubmissions = [];
-
-  // Get personal data
-  const personalData = await getACSubmissions(username, 20);
-  allSubmissions.push({
-    username: username,
-    submissions: personalData,
-  });
-
-  // Fetch past 20 submissions for each friend
-  const friendDataPromises = friends.map(async (friend) => {
-    const submissions = await getACSubmissions(friend, 20);
-    const currFriend = submissions.length > 0 ? submissions[0].username : 'No Name';
-    return {
-      username: currFriend,
-      submissions: submissions,
-    };
-  });
-
-  // Wait for all friend data promises to resolve
-  const friendData = await Promise.all(friendDataPromises);
-  allSubmissions = allSubmissions.concat(friendData);
-
-  // Fetch profile pics for all users
-  const allSubmissionsWithAvatarPromises = allSubmissions.map(async (stat) => {
-    const userData = await getUserProfilePic(stat.username);
-    const avatar = userData.userAvatar;
-    return { ...stat, avatar };
-  });
-
-  // Wait for all profile pic promises to resolve
-  const allSubmissionsWithAvatar = await Promise.all(allSubmissionsWithAvatarPromises);
-
-  // Now filter all submissions for each user using the specified timezone
-  allSubmissionsWithAvatar.forEach((user) => {
-    user.submissions = user.submissions.filter((submission) => isToday(submission.timestamp, timezone));
-    user.count = user.submissions.length;
-  });
-
-  // Sort the submissions
-  allSubmissionsWithAvatar.sort((x, y) => y.count - x.count);
-
-  return allSubmissionsWithAvatar;
-}
-
-/**
- *  Helper function to filter submissions from today in specified timezone
- * @param {number} timestamp - Unix timestamp in seconds
- * @param {string} timezone - IANA timezone string (e.g., "America/Chicago")
- * @returns {boolean} - True if timestamp is from today in the specified timezone
- */
-function isToday(timestamp, timezone) {
-  const submissionDate = getLocalDateString(timestamp, timezone);
-  const todayDate = getTodayInTimezone(timezone);
-  return submissionDate === todayDate;
-}
-
-/**
- * Helper function to check if a timestamp is from yesterday in specified timezone
- * @param {number} timestamp - Unix timestamp in seconds
- * @param {string} timezone - IANA timezone string (e.g., "America/Chicago")
- * @returns {boolean} - True if timestamp is from yesterday
- */
-function isYesterday(timestamp, timezone) {
-  const submissionDate = getLocalDateString(timestamp, timezone);
-
-  // Get yesterday's date in the specified timezone
-  const todayStr = getTodayInTimezone(timezone);
-  const todayParts = todayStr.split('-');
-  const todayInTZ = new Date(Date.UTC(parseInt(todayParts[0]), parseInt(todayParts[1]) - 1, parseInt(todayParts[2])));
-  todayInTZ.setUTCDate(todayInTZ.getUTCDate() - 1);
-
-  const yesterdayStr = todayInTZ.toISOString().split('T')[0];
-
-  return submissionDate === yesterdayStr;
-}
-
-/**
- * Helper function to check if a timestamp is from a specific day offset in specified timezone
- * @param {number} timestamp - Unix timestamp in seconds
- * @param {number} daysAgo - Number of days before today (0 = today, 1 = yesterday, etc.)
- * @param {string} timezone - IANA timezone string (e.g., "America/Chicago")
- * @returns {boolean} - True if timestamp is from the specified day
- */
-function isDaysAgo(timestamp, daysAgo, timezone) {
-  const submissionDate = getLocalDateString(timestamp, timezone);
-
-  // Get the target date (daysAgo from today) in the specified timezone
-  const todayStr = getTodayInTimezone(timezone);
-  const todayParts = todayStr.split('-');
-  const targetDate = new Date(Date.UTC(parseInt(todayParts[0]), parseInt(todayParts[1]) - 1, parseInt(todayParts[2])));
-  targetDate.setUTCDate(targetDate.getUTCDate() - daysAgo);
-
-  const targetDateStr = targetDate.toISOString().split('T')[0];
-
-  return submissionDate === targetDateStr;
-}
-
-/**
- * Get daily activity log for a user
- * Returns whether they solved yesterday based on immutable daily records
- */
-async function getDailyActivityLog(username, timezone) {
-  return new Promise((resolve) => {
-    chrome.storage.local.get(['dailyActivityLog'], (result) => {
-      const log = result.dailyActivityLog || {};
-      const yesterdayStr = getYesterdayInTimezone(timezone);
-
-      const userLog = log[username] || {};
-      const solvedYesterday = userLog[yesterdayStr] === true;
-
-      resolve({ solvedYesterday });
-    });
-  });
-}
-
-/**
- * Record that a user solved a problem today
- * This creates an immutable record that won't change even if they re-solve
- */
-async function recordDailyActivity(username, timezone) {
-  return new Promise((resolve) => {
-    chrome.storage.local.get(['dailyActivityLog'], (result) => {
-      const log = result.dailyActivityLog || {};
-      const todayStr = getTodayInTimezone(timezone);
-
-      // Initialize user's log if needed
-      if (!log[username]) {
-        log[username] = {};
-      }
-
-      // Only set to true if not already set (immutable once set)
-      if (!log[username][todayStr]) {
-        log[username][todayStr] = true;
-
-        // Clean up old entries (keep last 60 days only)
-        const dates = Object.keys(log[username]).sort();
-        if (dates.length > 60) {
-          dates.slice(0, dates.length - 60).forEach((date) => {
-            delete log[username][date];
-          });
-        }
-
-        chrome.storage.local.set({ dailyActivityLog: log }, () => {
-          console.log(`[Activity Log] Recorded activity for ${username} on ${todayStr}`);
-          resolve();
-        });
-      } else {
-        // Already recorded today
-        resolve();
-      }
-    });
-  });
-}
-
-/**
- * Get yesterday's date string in the specified timezone
- */
-function getYesterdayInTimezone(timezone) {
-  const today = new Date();
-  const yesterday = new Date(today);
-  yesterday.setDate(yesterday.getDate() - 1);
-
-  // Format as YYYY-MM-DD in the specified timezone
-  const dateStr = yesterday.toLocaleDateString('en-CA', {
-    timeZone: timezone,
-    year: 'numeric',
-    month: '2-digit',
-    day: '2-digit',
-  });
-
-  return dateStr;
-}
-
-/**
- * Loads strikes users data - calculates consecutive days users haven't solved problems
- * starting from yesterday and checking up to maxStrikes days back.
- * Also calculates streaks - consecutive days users have solved problems.
- * @param {string[]} friends - An array of usernames representing the friends of the current user
- * @param {string} username - The username of the current user
- * @param {number} maxStrikes - Maximum number of strikes to check (days back from yesterday)
- * @param {string} timezone - IANA timezone string (e.g., "America/Chicago") or 'auto' for auto-detect
- * @returns {object} - Object containing strikesUsers, clearedStrikesUsers, and streaksUsers arrays
- */
-async function loadStrikesUsersData(friends, username, maxStrikes = 3, timezone = 'America/Chicago') {
-  // Handle auto-detect timezone
-  if (timezone === 'auto') {
-    timezone = Intl.DateTimeFormat().resolvedOptions().timeZone;
-  }
-
-  // Get today's date in the timezone for cache key
-  const todayStr = getTodayInTimezone(timezone);
-
-  // Create cache key based on all users, maxStrikes, and today's date
-  const allUsers = [username, ...friends].sort();
-  const cacheKey = `strikes_${allUsers.join('_')}_${maxStrikes}_${todayStr}`;
-
-  // Check cache first
-  const cachedData = await cache.get(cacheKey);
-  if (cachedData !== null) {
-    console.log(`Cache hit for strikes data: ${cacheKey}`);
-    return cachedData;
-  }
-
-  console.log(`Cache miss for strikes data: ${cacheKey}, fetching from API`);
-
-  // Load previous streak data for comparison
-  const previousStreaksKey = 'previousStreaks';
-  let previousStreaks = {};
-  try {
-    const storedData = await new Promise((resolve) => {
-      chrome.storage.local.get([previousStreaksKey], (result) => {
-        resolve(result[previousStreaksKey] || {});
-      });
-    });
-    previousStreaks = storedData;
-  } catch (error) {
-    console.error('Error loading previous streaks:', error);
-  }
-
-  let strikesUsers = [];
-  let clearedStrikesUsers = [];
-  let streaksUsers = [];
-
-  // Check each user
-  for (const user of allUsers) {
-    const submissions = await getACSubmissions(user, 30);
-
-    // Check if user solved a problem today
-    const todaySubmissions = submissions.filter((submission) => isToday(submission.timestamp, timezone));
-    const clearsToday = todaySubmissions.length > 0;
-    // Get the most recent submission from today (if any)
-    const clearingSubmission = clearsToday ? todaySubmissions[0] : null;
-
-    const userData = await getUserProfilePic(user);
-
-    // Calculate streak FIRST - consecutive days with submissions
-    let streakCount = 0;
-    let lastProblemDate = null;
-    let startDay = clearsToday ? 0 : 1; // Start from today if solved today, else yesterday
-
-    for (let daysAgo = startDay; daysAgo < 30; daysAgo++) {
-      const daySubmissions = submissions.filter((submission) => isDaysAgo(submission.timestamp, daysAgo, timezone));
-
-      if (daySubmissions.length > 0) {
-        streakCount++;
-        // Capture the last problem date (most recent in the streak)
-        if (lastProblemDate === null && daySubmissions.length > 0) {
-          lastProblemDate = getLocalDateString(daySubmissions[0].timestamp, timezone);
-        }
-      } else {
-        // Streak broken
-        break;
-      }
-    }
-
-    // Detect impossible streak drops (caused by re-solved problems changing dates)
-    const previousStreak = previousStreaks[user] || 0;
-
-    if (streakCount > 0 && previousStreak > streakCount) {
-      // Streak dropped but didn't reset to 0 - this is impossible naturally
-      // A real streak can only: stay same, increase by 1, or drop to 0
-      // This means LeetCode API moved an old problem to today, creating a gap
-      console.log(`[Streak Fix] ${user}: Detected impossible drop from ${previousStreak} to ${streakCount}`);
-
-      if (clearsToday) {
-        // They solved today, so streak should have increased
-        streakCount = previousStreak + 1;
-        console.log(`[Streak Fix] ${user}: Restored to ${streakCount} (previous + 1)`);
-      } else {
-        // They didn't solve today, maintain previous streak
-        streakCount = previousStreak;
-        console.log(`[Streak Fix] ${user}: Restored to ${streakCount} (maintained)`);
-      }
-    }
-
-    // Count consecutive days starting from yesterday (up to maxStrikes days)
-    let strikeCount = 0;
-    for (let daysAgo = 1; daysAgo <= maxStrikes; daysAgo++) {
-      const daySubmissions = submissions.filter((submission) => isDaysAgo(submission.timestamp, daysAgo, timezone));
-
-      // If no submissions for this day, increment strike
-      if (daySubmissions.length === 0) {
-        strikeCount++;
-      } else {
-        // Stop counting if user was active (consecutive streak broken)
-        break;
-      }
-    }
-
-    // Check if user solved yesterday
-    const yesterdaySubmissions = submissions.filter((submission) => isDaysAgo(submission.timestamp, 1, timezone));
-    let solvedYesterday = yesterdaySubmissions.length > 0;
-
-    // ACTIVITY LOG: Check if user actually solved yesterday (before any re-solves)
-    // This is an immutable record set when they first solved, can't be changed by re-solves
-    const activityLog = await getDailyActivityLog(user, timezone);
-    const actuallysolvedYesterday = activityLog.solvedYesterday;
-
-    // STRIKE FIX: Use activity log to determine real vs false strikes
-    if (!solvedYesterday && actuallysolvedYesterday && clearsToday) {
-      // Activity log says they solved yesterday, but LeetCode API doesn't show it
-      // This means they re-solved that problem today (moved the date)
-      console.log(`[Strike Fix] ${user}: Activity log confirms solved yesterday, clearing false strike`);
-      solvedYesterday = true;
-      strikeCount = 0;
-    } else if (!solvedYesterday && !actuallysolvedYesterday && previousStreak > 0) {
-      // They genuinely missed yesterday - this is a real strike
-      console.log(`[Strike Fix] ${user}: Genuine miss yesterday (had ${previousStreak}-day streak)`);
-    }
-
-    // Record today's activity for tomorrow's calculation
-    if (clearsToday) {
-      await recordDailyActivity(user, timezone);
-    }
-
-    // Add to appropriate list
-    if (strikeCount > 0) {
-      // User has current strikes
-      strikesUsers.push({
-        username: user,
-        avatar: userData.userAvatar,
-        strikes: strikeCount,
-        clearsToday: clearsToday,
-        clearingSubmission: clearingSubmission,
-      });
-    } else if (solvedYesterday) {
-      // User solved yesterday and has no current strikes
-      // Check if they would have had strikes if they didn't solve yesterday
-      // by checking if they have any missing days from day 2 onwards
-      let wouldHaveHadStrikes = false;
-      for (let daysAgo = 2; daysAgo <= maxStrikes + 1; daysAgo++) {
-        const daySubmissions = submissions.filter((submission) => isDaysAgo(submission.timestamp, daysAgo, timezone));
-        if (daySubmissions.length === 0) {
-          // Found a gap - this means they would have had strikes
-          wouldHaveHadStrikes = true;
-          break;
-        } else {
-          // Found a submission - streak was broken, so no previous strikes
-          break;
-        }
-      }
-
-      // Only add to cleared list if they actually cleared strikes
-      if (wouldHaveHadStrikes) {
-        clearedStrikesUsers.push({
-          username: user,
-          avatar: userData.userAvatar,
-          clearedStrikes: true,
-        });
-      }
-    }
-
-    // Add to streaks list if streak is 2 or more days
-    if (streakCount >= 2) {
-      streaksUsers.push({
-        username: user,
-        avatar: userData.userAvatar,
-        streak: streakCount,
-        lastProblemDate: lastProblemDate,
-      });
-    }
-  }
-
-  // Sort by strikes descending (most strikes first)
-  strikesUsers.sort((a, b) => b.strikes - a.strikes);
-
-  // Sort streaks by streak count descending (longest streak first)
-  streaksUsers.sort((a, b) => b.streak - a.streak);
-
-  const result = { strikesUsers, clearedStrikesUsers, streaksUsers };
-
-  // Save current streaks for future comparison
-  const newPreviousStreaks = {};
-  streaksUsers.forEach((user) => {
-    newPreviousStreaks[user.username] = user.streak;
-  });
-  // Also save users with no streaks as 0
-  allUsers.forEach((user) => {
-    if (!newPreviousStreaks[user]) {
-      newPreviousStreaks[user] = 0;
-    }
-  });
-
-  try {
-    await new Promise((resolve) => {
-      chrome.storage.local.set({ [previousStreaksKey]: newPreviousStreaks }, () => {
-        console.log('[Streak Fix] Saved current streaks for future comparison');
-        resolve();
-      });
-    });
-  } catch (error) {
-    console.error('Error saving previous streaks:', error);
-  }
-
-  // Calculate TTL: 10 minutes, but not past midnight in the user's timezone
-  const ttlUntilMidnight = getTTLUntilMidnight(timezone);
-  const ttl = Math.min(TTL.SUBMISSIONS, ttlUntilMidnight);
-
-  // Cache the result
-  await cache.set(cacheKey, result, ttl);
-
-  return result;
-}
-
-/**
- * Helper function to get the start and end of the current week (Monday-Sunday)
- * @param {string} timezone - IANA timezone string (e.g., "America/Chicago") or 'auto' for auto-detect
- * @returns {object} - Object containing weekStart and weekEnd Date objects
- */
-function getCurrentWeekBounds(timezone = 'America/Chicago') {
-  // Handle auto-detect timezone
-  if (timezone === 'auto') {
-    timezone = Intl.DateTimeFormat().resolvedOptions().timeZone;
-  }
-
-  // Get today in the specified timezone
-  const todayStr = getTodayInTimezone(timezone);
-  const todayParts = todayStr.split('-');
-  const today = new Date(Date.UTC(parseInt(todayParts[0]), parseInt(todayParts[1]) - 1, parseInt(todayParts[2])));
-
-  // Get day of week (0 = Sunday, 1 = Monday, ..., 6 = Saturday)
-  const dayOfWeek = today.getUTCDay();
-
-  // Calculate days since Monday (Monday = 1, so adjust for Monday being start of week)
-  const daysSinceMonday = dayOfWeek === 0 ? 6 : dayOfWeek - 1;
-
-  // Calculate Monday of this week
-  const weekStart = new Date(today);
-  weekStart.setUTCDate(today.getUTCDate() - daysSinceMonday);
-
-  // Calculate Sunday of this week
-  const weekEnd = new Date(weekStart);
-  weekEnd.setUTCDate(weekStart.getUTCDate() + 6);
-
-  return { weekStart, weekEnd };
-}
-
-/**
- * Helper function to check if a timestamp is within the current week (Monday-Sunday)
- * @param {number} timestamp - Unix timestamp in seconds
- * @param {Date} weekStart - Start of week (Monday)
- * @param {Date} weekEnd - End of week (Sunday)
- * @param {string} timezone - IANA timezone string
- * @returns {boolean} - True if timestamp is within the current week
- */
-function isInCurrentWeek(timestamp, weekStart, weekEnd, timezone) {
-  const submissionDate = getLocalDateString(timestamp, timezone);
-  const weekStartStr = weekStart.toISOString().split('T')[0];
-  const weekEndStr = weekEnd.toISOString().split('T')[0];
-
-  return submissionDate >= weekStartStr && submissionDate <= weekEndStr;
+function getWeeklyLeaderboardData() {
+  return cachedContestData
+    .map(({ username, avatar, submissions }) => ({
+      username,
+      avatar,
+      count: Array.isArray(submissions) ? submissions.length : 0,
+    }))
+    .sort((x, y) => y.count - x.count);
 }
 
 /**
@@ -979,9 +590,7 @@ async function loadContestData(friends, username, timezone = 'America/Chicago') 
     timezone = Intl.DateTimeFormat().resolvedOptions().timeZone;
   }
 
-  const { weekStart, weekEnd } = getCurrentWeekBounds(timezone);
-  const weekStartFormatted = weekStart.toISOString().split('T')[0];
-  const weekEndFormatted = weekEnd.toISOString().split('T')[0];
+  const { weekStart, weekEnd, weekStartFormatted, weekEndFormatted } = getCurrentWeekBounds(timezone);
 
   // Create cache key based on all users and current week
   const allUsers = [username, ...friends].sort();
@@ -998,15 +607,18 @@ async function loadContestData(friends, username, timezone = 'America/Chicago') 
 
   const contestData = [];
 
-  // Fetch submissions for each user
+  // Fetch submissions for each user. The public LeetCode endpoint caps results
+  // at 20 regardless of the requested limit, so we filter to the current week
+  // and merge each batch into a per-user weekly store. This accumulates
+  // submissions across refreshes and captures more than the 20 most recent
+  // when a user has been highly active.
   for (const user of allUsers) {
-    const submissions = await getACSubmissions(user, 50); // Get more submissions to cover the week
+    const submissions = await getACSubmissions(user, 20);
     const userData = await getUserProfilePic(user);
 
-    // Filter submissions for current week
-    const weekSubmissions = submissions.filter((submission) =>
-      isInCurrentWeek(submission.timestamp, weekStart, weekEnd, timezone)
-    );
+    // Filter to the current week before accumulating so the store stays bounded
+    const recentWeekSubmissions = filterSubmissionsInWeek(submissions, weekStart, weekEnd, timezone);
+    const weekSubmissions = await accumulateWeeklySubmissions(user, weekStartFormatted, recentWeekSubmissions);
 
     // Calculate points for each submission
     let totalPoints = 0;
@@ -1014,11 +626,7 @@ async function loadContestData(friends, username, timezone = 'America/Chicago') 
       weekSubmissions.map(async (submission) => {
         const problemData = await questionDifficulty(submission.titleSlug);
         const difficulty = problemData.difficulty;
-        let points = 0;
-
-        if (difficulty === 'Easy') points = 1;
-        else if (difficulty === 'Medium') points = 3;
-        else if (difficulty === 'Hard') points = 6;
+        const points = getPointsForDifficulty(difficulty);
 
         totalPoints += points;
 
@@ -1031,7 +639,6 @@ async function loadContestData(friends, username, timezone = 'America/Chicago') 
       avatar: userData.userAvatar,
       points: totalPoints,
       submissions: problemsWithDifficulty,
-      submissionCount: weekSubmissions.length,
     });
   }
 
@@ -1225,7 +832,7 @@ document.getElementById('update-max-strikes-btn').addEventListener('click', asyn
         cachedStrikesData = strikesUsers;
         cachedClearedStrikesData = clearedStrikesUsers;
         cachedStreaksData = streaksUsers;
-        displayStrikesUsers(strikesUsers, clearedStrikesUsers, streaksUsers, result.username);
+        displayStrikesUsers(strikesUsers, clearedStrikesUsers, streaksUsers, result.username, cachedStrikesStreaksView);
       }
     });
   });
@@ -1256,10 +863,22 @@ document.getElementById('timezone-select').addEventListener('change', async () =
         cachedStrikesData = strikesUsers;
         cachedClearedStrikesData = clearedStrikesUsers;
         cachedStreaksData = streaksUsers;
-        displayStrikesUsers(strikesUsers, clearedStrikesUsers, streaksUsers, result.username);
+        displayStrikesUsers(strikesUsers, clearedStrikesUsers, streaksUsers, result.username, cachedStrikesStreaksView);
       }
     });
   });
+});
+
+/**
+ * Listener for the streaks/strikes display setting
+ */
+document.getElementById('strikes-streaks-select').addEventListener('change', async (event) => {
+  const viewMode = event.target.value;
+  cachedStrikesStreaksView = viewMode;
+
+  await new Promise((resolve) => chrome.storage.local.set({ strikesStreaksView: viewMode }, resolve));
+
+  displayStrikesUsers(cachedStrikesData, cachedClearedStrikesData, cachedStreaksData, currentUsername, viewMode);
 });
 
 /**
@@ -1268,7 +887,7 @@ document.getElementById('timezone-select').addEventListener('change', async () =
 let cachedStrikesData = [];
 let cachedClearedStrikesData = [];
 let cachedStreaksData = [];
-let cachedDailyData = null;
+let cachedStrikesStreaksView = 'both';
 let cachedContestData = [];
 let cachedGlobalRankingsData = [];
 let cachedActivitySubmissions = [];
@@ -1334,7 +953,7 @@ document.getElementById('copy-strikes-btn').addEventListener('click', () => {
       // Visual feedback
       const button = document.getElementById('copy-strikes-btn');
       const originalText = button.textContent;
-      button.textContent = '✓';
+      button.textContent = 'Copied!';
       setTimeout(() => {
         button.textContent = originalText;
       }, 1000);
@@ -1346,6 +965,134 @@ document.getElementById('copy-strikes-btn').addEventListener('click', () => {
 });
 
 /**
+ * Reloads every tab's data. When `force` is true the caches are cleared first so
+ * fresh data is always fetched; otherwise cached entries are reused until their
+ * own TTLs expire (used by the shared refresh cycle).
+ * @param {object} [options]
+ * @param {boolean} [options.force=false]
+ */
+async function reloadAllData({ force = false } = {}) {
+  const { username, friends = [], maxStrikes = 3, timezone = 'America/Chicago' } = await new Promise((resolve) =>
+    chrome.storage.local.get(
+      { username: null, friends: [], maxStrikes: 3, timezone: 'America/Chicago' },
+      resolve
+    )
+  );
+
+  if (!username) {
+    return;
+  }
+
+  const allUsers = [username, ...friends];
+
+  if (force) {
+    for (const user of allUsers) {
+      await cache.delete(`submissions_${user}_5`);
+      await cache.delete(`submissions_${user}_20`);
+      await cache.delete(`submissions_${user}_30`);
+      await cache.delete(`submissions_${user}_50`);
+      await cache.delete(`user_stats_${user}`);
+      await cache.delete(`problem_ranking_${user}`);
+      await cache.delete(`user_calendar_${user}`);
+    }
+
+    const { weekStart } = getCurrentWeekBounds(timezone);
+    const weekStartFormatted = weekStart.toISOString().split('T')[0];
+    const sortedUsers = [...allUsers].sort();
+    await cache.delete(`contest_${sortedUsers.join('_')}_${weekStartFormatted}`);
+
+    const todayStr = getTodayInTimezone(timezone);
+    await cache.delete(`strikes_${sortedUsers.join('_')}_${maxStrikes}_${todayStr}`);
+  }
+
+  // Activity
+  currentUsername = username;
+  let allSubmissions = [await getACSubmissions(username, 5)];
+  const friendSubmissions = await Promise.all(friends.map((friend) => getACSubmissions(friend, 5)));
+  friendSubmissions.forEach((submissions) => {
+    allSubmissions = allSubmissions.concat(submissions);
+  });
+  cachedActivitySubmissions = allSubmissions;
+  displayACSubmissions(allSubmissions, username);
+  loadSelfSummary(username);
+
+  // Contest (loaded before the leaderboard so the Weekly view can reuse it)
+  const contestResult = await loadContestData(friends, username, timezone);
+  cachedContestData = contestResult.contestData;
+  displayContestLeaderboard(contestResult.contestData, contestResult.weekStart, contestResult.weekEnd, username);
+
+  // Leaderboard
+  const leaderboardData = await getUserProblemStats(username);
+  const leaderboardFriendData = await Promise.all(friends.map((friend) => getUserProblemStats(friend)));
+  leaderboardFriendData.push(leaderboardData);
+
+  const friendDataResolved = await Promise.all(
+    leaderboardFriendData.map(async (stat) => {
+      const userData = await getUserProfilePic(stat.username);
+      return { ...stat, avatar: userData.userAvatar };
+    })
+  );
+
+  // Rebind the leaderboard tabs after their rows are re-rendered
+  document.querySelectorAll('.leaderboard-tab').forEach((tab) => {
+    const newTab = tab.cloneNode(true);
+    tab.parentNode.replaceChild(newTab, tab);
+  });
+
+  document.querySelectorAll('.leaderboard-tab').forEach((tab) => {
+    tab.addEventListener('click', () => {
+      document.querySelectorAll('.leaderboard-tab').forEach((t) => t.classList.remove('active'));
+      tab.classList.add('active');
+      const difficulty = tab.getAttribute('data-difficulty');
+      const diffMap = { All: 0, Easy: 1, Medium: 2, Hard: 3, Weekly: 4 };
+      displayLeaderboard(friendDataResolved, getWeeklyLeaderboardData(), username, diffMap[difficulty]);
+    });
+  });
+
+  const activeTab = document.querySelector('.leaderboard-tab.active');
+  const difficulty = activeTab ? activeTab.getAttribute('data-difficulty') : 'All';
+  const diffMap = { All: 0, Easy: 1, Medium: 2, Hard: 3, Weekly: 4 };
+  displayLeaderboard(friendDataResolved, getWeeklyLeaderboardData(), username, diffMap[difficulty]);
+
+  // Strikes
+  const { strikesUsers, clearedStrikesUsers, streaksUsers } = await loadStrikesUsersData(
+    friends,
+    username,
+    maxStrikes,
+    timezone
+  );
+  cachedStrikesData = strikesUsers;
+  cachedClearedStrikesData = clearedStrikesUsers;
+  cachedStreaksData = streaksUsers;
+  displayStrikesUsers(strikesUsers, clearedStrikesUsers, streaksUsers, username, cachedStrikesStreaksView);
+
+  // Global rankings
+  cachedGlobalRankingsData = await loadGlobalRankingsData(friends, username, timezone, {
+    updateSnapshots: false,
+  });
+  displayGlobalRankings(cachedGlobalRankingsData, username);
+}
+
+/**
+ * Renders the shared countdown on every tab and runs the single refresh cycle
+ * that re-checks all data when it elapses.
+ */
+async function startSharedRefresh() {
+  try {
+    if (updateTimers.length === 0) {
+      updateTimers = TIMER_CONTAINERS.map((id) => createUpdateTimer(id));
+    }
+
+    if (refreshCycle) {
+      refreshCycle.destroy();
+    }
+    refreshCycle = await startRefreshCycle(() => reloadAllData());
+  } catch (error) {
+    console.error('Failed to start refresh cycle:', error);
+  }
+}
+
+/**
  * Listener for refresh all data button in settings
  */
 document.getElementById('refresh-all-btn').addEventListener('click', async () => {
@@ -1353,132 +1100,18 @@ document.getElementById('refresh-all-btn').addEventListener('click', async () =>
   const originalText = button.textContent;
   button.disabled = true;
   button.textContent = '⏳ Refreshing...';
+  showAllSkeletons();
 
   try {
-    chrome.storage.local.get(['username', 'friends', 'maxStrikes', 'timezone'], async (result) => {
-      const username = result.username;
-      const friends = result.friends || [];
-      const maxStrikes = result.maxStrikes || 3;
-      const timezone = result.timezone || 'America/Chicago';
-      const allUsers = [username, ...friends];
-
-      // Clear all caches
-      for (const user of allUsers) {
-        await cache.delete(`submissions_${user}_5`);
-        await cache.delete(`submissions_${user}_20`);
-        await cache.delete(`submissions_${user}_30`);
-        await cache.delete(`submissions_${user}_50`);
-        await cache.delete(`user_stats_${user}`);
-        await cache.delete(`problem_ranking_${user}`);
-      }
-
-      // Clear contest cache
-      const { weekStart } = getCurrentWeekBounds(timezone);
-      const weekStartFormatted = weekStart.toISOString().split('T')[0];
-      const sortedUsers = [...allUsers].sort();
-      const contestCacheKey = `contest_${sortedUsers.join('_')}_${weekStartFormatted}`;
-      await cache.delete(contestCacheKey);
-
-      // Clear strikes cache
-      const todayStr = getTodayInTimezone(timezone);
-      const strikesCacheKey = `strikes_${sortedUsers.join('_')}_${maxStrikes}_${todayStr}`;
-      await cache.delete(strikesCacheKey);
-
-      // Reload all data
-      // Activity
-      currentUsername = username;
-      let allSubmissions = [];
-      const data = await getACSubmissions(username, 5);
-      allSubmissions = allSubmissions.concat(data);
-      const friendDataPromises = friends.map((friend) => getACSubmissions(friend, 5));
-      const friendData = await Promise.all(friendDataPromises);
-      friendData.forEach((submissions) => {
-        allSubmissions = allSubmissions.concat(submissions);
-      });
-      cachedActivitySubmissions = allSubmissions;
-      displayACSubmissions(allSubmissions, username);
-
-      // Leaderboard
-      cachedDailyData = await loadDailyLeaderboardData(friends, username, timezone);
-      let leaderboardData = await getUserProblemStats(username);
-      const leaderboardFriendPromises = friends.map((friend) => getUserProblemStats(friend));
-      const leaderboardFriendData = await Promise.all(leaderboardFriendPromises);
-      leaderboardFriendData.push(leaderboardData);
-
-      const friendDataWithAvatars = leaderboardFriendData.map(async (stat) => {
-        const userData = await getUserProfilePic(stat.username);
-        const avatar = userData.userAvatar;
-        return { ...stat, avatar };
-      });
-      const friendDataResolved = await Promise.all(friendDataWithAvatars);
-
-      // Update leaderboard tabs
-      const leaderboardTabs = document.querySelectorAll('.leaderboard-tab');
-      leaderboardTabs.forEach((tab) => {
-        const newTab = tab.cloneNode(true);
-        tab.parentNode.replaceChild(newTab, tab);
-      });
-
-      document.querySelectorAll('.leaderboard-tab').forEach((tab) => {
-        tab.addEventListener('click', () => {
-          document.querySelectorAll('.leaderboard-tab').forEach((t) => t.classList.remove('active'));
-          tab.classList.add('active');
-          let difficulty = tab.getAttribute('data-difficulty');
-          const diffMap = { All: 0, Easy: 1, Medium: 2, Hard: 3, Daily: 4 };
-          displayLeaderboard(friendDataResolved, cachedDailyData, username, diffMap[difficulty]);
-        });
-      });
-
-      const activeTab = document.querySelector('.leaderboard-tab.active');
-      const difficulty = activeTab ? activeTab.getAttribute('data-difficulty') : 'All';
-      const diffMap = { All: 0, Easy: 1, Medium: 2, Hard: 3, Daily: 4 };
-      displayLeaderboard(friendDataResolved, cachedDailyData, username, diffMap[difficulty]);
-
-      // Strikes
-      const { strikesUsers, clearedStrikesUsers, streaksUsers } = await loadStrikesUsersData(
-        friends,
-        username,
-        maxStrikes,
-        timezone
-      );
-      cachedStrikesData = strikesUsers;
-      cachedClearedStrikesData = clearedStrikesUsers;
-      cachedStreaksData = streaksUsers;
-      displayStrikesUsers(strikesUsers, clearedStrikesUsers, streaksUsers, username);
-
-      // Contest
-      const contestResult = await loadContestData(friends, username, timezone);
-      cachedContestData = contestResult.contestData;
-      displayContestLeaderboard(contestResult.contestData, contestResult.weekStart, contestResult.weekEnd, username);
-
-      cachedGlobalRankingsData = await loadGlobalRankingsData(friends, username, timezone, {
-        updateSnapshots: false,
-      });
-      displayGlobalRankings(cachedGlobalRankingsData, username);
-
-      // Restart all timers
-      if (activityTimer) activityTimer.destroy();
-      activityTimer = createUpdateTimer('activity', getSubmissionsCacheKeys(allUsers, 5));
-
-      if (leaderboardTimer) leaderboardTimer.destroy();
-      const leaderboardCacheKeys = [...getUserStatsCacheKeys(allUsers), ...getSubmissionsCacheKeys(allUsers, 20)];
-      leaderboardTimer = createUpdateTimer('leaderboard', leaderboardCacheKeys);
-
-      if (strikesTimer) strikesTimer.destroy();
-      strikesTimer = createUpdateTimer('strikes', getSubmissionsCacheKeys(allUsers, 30));
-
-      if (globalRankingsTimer) globalRankingsTimer.destroy();
-      globalRankingsTimer = createUpdateTimer('global-rankings', getGlobalRankingCacheKeys(allUsers));
-
-      button.disabled = false;
-      button.textContent = originalText;
-      alert('All data refreshed successfully!');
-    });
+    await reloadAllData({ force: true });
+    await resetRefreshSchedule();
+    alert('All data refreshed successfully!');
   } catch (error) {
     console.error('Error refreshing all data:', error);
+    alert('Error refreshing data. Please try again.');
+  } finally {
     button.disabled = false;
     button.textContent = originalText;
-    alert('Error refreshing data. Please try again.');
   }
 });
 
@@ -1519,6 +1152,24 @@ document.getElementById('tab-visibility-toggles').addEventListener('change', asy
 });
 
 /**
+ * Listener for the copy button setting
+ */
+document.getElementById('copy-button-toggle').addEventListener('change', async (event) => {
+  const enabled = event.target.checked;
+  await saveCopyButtonEnabled(enabled);
+  applyCopyButtonEnabled(enabled);
+});
+
+/**
+ * Listener for the podium rank theme setting
+ */
+document.getElementById('rank-theme-select').addEventListener('change', async (event) => {
+  const theme = event.target.value;
+  await saveRankTheme(theme);
+  applyRankTheme(theme);
+});
+
+/**
  * Listener for activity search filter
  */
 document.getElementById('activity-search').addEventListener('input', (e) => {
@@ -1533,6 +1184,53 @@ document.getElementById('activity-clear-filter').addEventListener('click', () =>
   document.getElementById('activity-search').value = '';
   displayACSubmissions(cachedActivitySubmissions, currentUsername, '');
 });
+
+/**
+ * Populates the profile row in the top-left with the current user's avatar
+ * and username. Reveals the identity block only once a username is known.
+ * @param {String} username - The current user's LeetCode username.
+ */
+async function setProfileHeader(username) {
+  if (!username) return;
+
+  const identity = document.getElementById('profile-identity');
+  const selfUsername = document.getElementById('self-username');
+  selfUsername.textContent = username;
+  selfUsername.onclick = () => {
+    window.open(`https://leetcode.com/${encodeURIComponent(username)}/`, '_blank', 'noopener');
+  };
+
+  try {
+    const profile = await getUserProfilePic(username);
+    if (profile?.userAvatar) {
+      document.getElementById('self-avatar').src = profile.userAvatar;
+    }
+  } catch (error) {
+    console.error('Failed to load profile avatar:', error);
+  }
+
+  identity.hidden = false;
+}
+
+/**
+ * Loads and renders the current user's solved totals and 30-day activity
+ * heatmap at the top of the Activity tab.
+ * @param {String} username - The current user's LeetCode username.
+ */
+async function loadSelfSummary(username) {
+  if (!username) return;
+
+  try {
+    const [stats, calendar] = await Promise.all([
+      getUserProblemStats(username),
+      getUserCalendar(username),
+    ]);
+    displaySolvedStats(stats);
+    displayActivityHeatmap(calendar);
+  } catch (error) {
+    console.error('Failed to load user summary:', error);
+  }
+}
 
 /**
  * Changes which page is shown as content based off tab bar.

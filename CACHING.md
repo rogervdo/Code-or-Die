@@ -12,8 +12,8 @@ This extension now implements a comprehensive caching system using `chrome.stora
   - Stats change slowly as users solve problems
 - **Recent Submissions**: 10 minutes (600,000 ms)
   - Most dynamic data, needs frequent updates
-- **Daily Leaderboard**: 5 minutes (300,000 ms)
-  - Updates frequently throughout the day
+- **Weekly Leaderboard / Contest**: 30 minutes (1,800,000 ms)
+  - Updates as new submissions come in across the week
 
 ## How It Works
 
@@ -80,7 +80,7 @@ await cache.delete('submissions_username_20');
 
 ## Update Timer
 
-Each page (Activity, Leaderboard, Strikes) displays a small timer showing when the cached data will expire and refresh:
+Each page (Activity, Leaderboard, Streaks) displays a small timer showing when the cached data will expire and refresh:
 
 - **"Updates in 9m 45s"** - Real-time countdown to cache expiration
 - **"Updates on next open"** - When no cache exists yet

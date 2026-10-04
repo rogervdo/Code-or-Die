@@ -1,109 +1,78 @@
 # Update Timer Feature
 
 ## Overview
-A real-time countdown timer that displays when each page's cached data will expire and be refreshed.
+Every tab shows the same countdown to the next scheduled data refresh. A single
+shared deadline drives both the countdown and the refresh itself, so the timers
+on all tabs always agree.
 
 ## Display Format
 
-The timer shows in a small, unobtrusive text below each page heading:
+Each tab renders the same text below its content:
 
-- **"Updates in 9m 45s"** - Shows minutes and seconds when under 1 hour
-- **"Updates in 1h 30m"** - Shows hours and minutes when under 24 hours
-- **"Updates in 2d 5h"** - Shows days and hours when over 24 hours
-- **"Updates on next open"** - When no cache exists yet
-- **"Updating..."** - When cache has expired and will refresh
+- **"Updates in 9m 45s"** - Time left until the next refresh (minutes and seconds)
+- **"Updates in 1h 30m"** - Hours and minutes when more than an hour remains
+- **"Updates in 2d 5h"** - Days and hours when more than a day remains
+- **"Updating…"** - The deadline has passed and a refresh is in flight
 
-## Page-Specific Timers
+## How It Works
 
-### Activity Page
-- **Monitors**: Recent submission cache (5 submissions per user)
-- **Cache TTL**: 10 minutes
-- **Updates**: Shows the shortest time until any user's submissions expire
+1. **Shared deadline** - `nextRefreshAt` (epoch ms) is persisted in
+   `chrome.storage.local` and mirrored in memory. Every tab's timer renders that
+   one value.
+2. **One cycle** - `startRefreshCycle(onRefresh)` checks the deadline once a
+   second. When it passes it calls `onRefresh`, which reloads every tab's data,
+   then opens the next window with `resetRefreshSchedule()`.
+3. **Cache-aware refresh** - The scheduled refresh re-runs the normal load
+   functions, which reuse cached entries until their own TTLs expire. The
+   "Refresh All Data" button instead clears the caches first
+   (`reloadAllData({ force: true })`) and restarts the window.
 
-### Leaderboard Page
-- **Monitors**:
-  - User problem stats cache (2 hour TTL)
-  - Daily submissions cache (20 submissions per user, 10 minute TTL)
-- **Cache TTL**: Varies (2 hours for stats, 10 minutes for submissions)
-- **Updates**: Shows the shortest time among all monitored caches
+## Timers
 
-### Strikes Page
-- **Monitors**: Recent submission cache (30 submissions per user)
-- **Cache TTL**: 10 minutes
-- **Updates**: Shows the shortest time until any user's submissions expire
+A countdown is rendered on every tab: Activity, Leaderboard, Contest, Global,
+and Streaks. All of them show the same shared deadline.
 
 ## Technical Implementation
 
-### Files Modified
-1. **utils/cache.js** - Added `getMetadata()` method to retrieve cache expiration info
-2. **utils/updateTimer.js** - New module for timer logic and display
-3. **popup/popup.js** - Integrated timers for each page
-4. **popup/popup.html** - Added `page-header` containers
-5. **popup/popup.css** - Styled the timer display
-
-### How It Works
-
-1. **Timer Creation**: When a page loads, `createUpdateTimer()` is called with:
-   - Container ID (e.g., 'activity', 'leaderboard', 'strikes')
-   - Array of cache keys to monitor
-
-2. **Cache Monitoring**: Timer checks all relevant cache keys and finds the shortest time until expiry
-
-3. **Live Updates**: Timer updates every second to show countdown in real-time
-
-4. **Automatic Cleanup**: When timers are destroyed (page switch, popup close), intervals are cleared
+### Files
+1. **utils/updateTimer.js** - Shared schedule, countdown element, and refresh cycle
+2. **popup/popup.js** - `startSharedRefresh()`, `reloadAllData()`, and button wiring
+3. **popup/popup.css** - `.update-timer` styling
 
 ### Key Functions
 
-#### `createUpdateTimer(containerId, cacheKeys)`
-Creates and manages a timer for a specific page.
+#### `resetRefreshSchedule(from = Date.now())`
+Opens a new window and persists `nextRefreshAt = from + REFRESH_INTERVAL_MS`.
 
-```javascript
-// Example: Activity page timer
-const allUsers = ['user1', 'user2'];
-activityTimer = createUpdateTimer('activity', getSubmissionsCacheKeys(allUsers, 5));
-```
+#### `restoreRefreshSchedule()`
+Loads the persisted deadline, or opens a fresh window when it is missing or has
+already elapsed.
 
-#### `getSubmissionsCacheKeys(usernames, limit)`
-Generates cache keys for submission data.
+#### `createUpdateTimer(containerId)`
+Creates the countdown element for one page and updates it every second from the
+shared deadline.
 
-#### `getUserStatsCacheKeys(usernames)`
-Generates cache keys for user statistics data.
+#### `startRefreshCycle(onRefresh)`
+Runs `onRefresh` when the shared deadline passes, then opens the next window.
+Returns a `{ destroy }` handle.
 
 #### `formatTime(ms)`
-Converts milliseconds to human-readable format (e.g., "9m 45s").
+Converts milliseconds to a human-readable string (e.g. "9m 45s").
 
 ## User Benefits
 
-1. **Transparency**: Users know exactly when data will refresh
-2. **Patience**: Clear expectations prevent excessive popup reopening
-3. **Trust**: Shows the caching system is working correctly
-4. **Control**: Users can wait for auto-refresh or manually reopen to force update
-
-## Design Choices
-
-### Why Shortest Time?
-Each page may monitor multiple cache keys with different TTLs. We show the shortest time because that's when the page will start showing partial fresh data.
-
-### Why Update Every Second?
-Provides smooth, real-time countdown experience. The overhead is minimal (just timestamp comparisons).
-
-### Why Per-Page Timers?
-Different pages cache different data with different TTLs. Page-specific timers give accurate, relevant information.
+1. **Consistency** - Every tab shows the same countdown.
+2. **Transparency** - Users know exactly when the next refresh happens.
+3. **Live data** - Data refreshes on the countdown instead of only on reopen.
 
 ## Testing
 
-To verify timers work:
-
-1. Open extension and observe timer on Activity page
-2. Wait and watch the countdown decrease
-3. Switch to Leaderboard tab - timer should show different time
-4. Switch to Strikes tab - timer should show another time
-5. After countdown reaches 0, reopen popup to see fresh data
+1. Open the extension and confirm every tab shows the same countdown.
+2. Switch tabs - the countdown should match.
+3. Use "Refresh All Data" - the countdown restarts at 10 minutes.
 
 ## Future Enhancements
 
-- Add refresh button next to timer for manual refresh
-- Show "Loading..." state when fetching fresh data
-- Add visual indicator when cache is about to expire (< 1 minute)
-- Allow users to configure cache TTLs in settings
+- Show "Loading…" state while the scheduled refresh runs
+- Add a visual indicator when the refresh is under a minute away
+- Allow users to configure the refresh interval in settings

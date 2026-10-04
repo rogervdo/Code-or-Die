@@ -1,0 +1,16 @@
+{
+  "name": "code-or-die",
+  "version": "1.5.0",
+  "private": true,
+  "type": "module",
+  "description": "Extension to view the activity of your friends on LeetCode",
+  "scripts": {
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:coverage": "vitest run --coverage"
+  },
+  "devDependencies": {
+    "@vitest/coverage-v8": "^4.1.11",
+    "vitest": "^4.1.11"
+  }
+}

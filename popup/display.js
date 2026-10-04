@@ -6,6 +6,13 @@
 import questionDifficulty from '../GQLQueries/questionDifficulty.js';
 import { timeDifference } from './helper.js';
 import getUserProfilePic from '../GQLQueries/getUserProfilePic.js';
+import { removeFriendData } from '../utils/friendData.js';
+import {
+  buildActivityGrid,
+  formatAxisDate,
+  formatHeatmapTooltip,
+  getActivityLevel,
+} from '../utils/activityHeatmap.js';
 
 /**
  * Displays the friends list.
@@ -34,11 +41,12 @@ export function displayFriendsList(friends) {
     removeButton.textContent = 'x';
     removeButton.classList.add('remove-btn');
     removeButton.addEventListener('click', () => {
-        // Remove friend from stored list
+        // Remove friend from stored list and purge everything we stored for them
         chrome.storage.local.get({ friends: [] }, (result) => {
             const updatedFriends = result.friends.filter(f => f !== friend);
-            chrome.storage.local.set({ friends: updatedFriends }, () => {
+            chrome.storage.local.set({ friends: updatedFriends }, async () => {
             displayFriendsList(updatedFriends);
+            await removeFriendData(friend);
             });
         });
     });
@@ -55,12 +63,12 @@ export function displayFriendsList(friends) {
  * Displays the leaderboard.
  * @param {Array} leaderboardStats - The leaderboard statistics.
  * @param {string} username - The current username.
- * @param {number} diff - The difficulty level (0: All, 1: Easy, 2: Medium, 3: Hard, 4: Daily).
- *                         4 (Daily) is a special case, not a difficulty.
+ * @param {number} diff - The difficulty level (0: All, 1: Easy, 2: Medium, 3: Hard, 4: Weekly).
+ *                         4 (Weekly) is a special case, not a difficulty.
  */
-export function displayLeaderboard(leaderboardStats, dailyStats, username, diff) {
-  // choose between default leaderboard stats or daily stats
-  if (diff === 4) leaderboardStats = dailyStats;
+export function displayLeaderboard(leaderboardStats, weeklyStats, username, diff) {
+  // choose between default leaderboard stats or weekly stats
+  if (diff === 4) leaderboardStats = weeklyStats;
   // sort by problems solved
   if (diff !== 4) {
     leaderboardStats.sort(function(x, y) {
@@ -93,6 +101,14 @@ export function displayLeaderboard(leaderboardStats, dailyStats, username, diff)
     leaderboardStats.forEach( (stat, idx) => {
       const listItem = document.createElement('li');
       listItem.classList.add('stat-row');
+      if (idx < 3) {
+        listItem.classList.add(`rank-${idx + 1}`);
+      }
+
+      // Rank (ordinal, matching the Contest tab)
+      const rank = document.createElement('p');
+      rank.classList.add('stat-row-rank');
+      rank.textContent = formatOrdinal(idx + 1);
 
       // Avatar
       const avatar = document.createElement('img');
@@ -100,42 +116,31 @@ export function displayLeaderboard(leaderboardStats, dailyStats, username, diff)
       avatar.src = `${stat.avatar}`;
       avatar.alt = `${stat.username}'s profile picture`;
 
-      // Medal for top 3 positions
-      let medal = null;
-      if (idx === 0) {
-        medal = document.createElement('img');
-        medal.classList.add('medal-icon');
-        medal.src = '../gold-medal.png';
-        medal.alt = 'Gold medal';
-      } else if (idx === 1) {
-        medal = document.createElement('img');
-        medal.classList.add('medal-icon');
-        medal.src = '../silver-medal.png';
-        medal.alt = 'Silver medal';
-      } else if (idx === 2) {
-        medal = document.createElement('img');
-        medal.classList.add('medal-icon');
-        medal.src = '../bronze-medal.png';
-        medal.alt = 'Bronze medal';
-      }
-
       // Username
-      const title = document.createElement('p');
-      title.classList.add('stat-row-title');
-      title.textContent = `${idx+1}. ${stat.username}`;
+      const username = document.createElement('p');
+      username.classList.add('stat-row-username');
+      username.textContent = stat.username;
 
       // number of problems solved
       const problemsSolved = (diff === 4) ? stat.count : stat.acSubmissionNum[diff].count;
+      const solvedContainer = document.createElement('div');
+      solvedContainer.classList.add('stat-row-points-container');
+
       const solved = document.createElement('p');
-      solved.classList.add('stat-row-solved');
+      solved.classList.add('stat-row-points');
       solved.textContent = `${problemsSolved}`;
 
+      const solvedLabel = document.createElement('span');
+      solvedLabel.classList.add('stat-row-points-label');
+      solvedLabel.textContent = 'solved';
+
+      solvedContainer.appendChild(solved);
+      solvedContainer.appendChild(solvedLabel);
+
+      listItem.appendChild(rank);
       listItem.appendChild(avatar);
-      listItem.appendChild(title);
-      if (medal) {
-        listItem.appendChild(medal);
-      }
-      listItem.appendChild(solved);
+      listItem.appendChild(username);
+      listItem.appendChild(solvedContainer);
 
       list.appendChild(listItem);
     });
@@ -152,127 +157,54 @@ export function displayLeaderboard(leaderboardStats, dailyStats, username, diff)
  * @param {string} username - The current username.
  */
 /**
- * Displays users with strikes (consecutive days without solving problems) and streaks.
+ * Displays users with streaks (consecutive days solving) and strikes (consecutive days missed).
  * @param {Array} strikesUsers - Array of user objects with username, avatar, and strikes count.
  * @param {Array} clearedStrikesUsers - Array of user objects who cleared their strikes yesterday.
  * @param {Array} streaksUsers - Array of user objects with username, avatar, streak count, and last problem date.
  * @param {string} currentUsername - The current user's username.
+ * @param {'both'|'strikes'|'streaks'} viewMode - Which section(s) to render.
  */
-export function displayStrikesUsers(strikesUsers, clearedStrikesUsers, streaksUsers, currentUsername) {
+export function displayStrikesUsers(
+  strikesUsers,
+  clearedStrikesUsers,
+  streaksUsers,
+  currentUsername,
+  viewMode = 'both'
+) {
+  const currentUserStreak = (streaksUsers || []).find((user) => user.username === currentUsername);
+  const streakCount = currentUserStreak ? currentUserStreak.streak : 0;
+
+  const headerStreak = document.getElementById('header-streak-count');
+  if (headerStreak) {
+    headerStreak.textContent = streakCount;
+  }
+
+  // Reflect the streak on the toolbar icon badge
+  if (typeof chrome !== 'undefined' && chrome.action?.setBadgeText) {
+    chrome.action.setBadgeBackgroundColor({ color: '#ff9f0a' });
+    chrome.action.setBadgeTextColor?.({ color: '#1e1e1e' });
+    chrome.action.setBadgeText({ text: streakCount > 0 ? String(streakCount) : '' });
+  }
+
   const resultsContainer = document.getElementById('strikes-list');
   resultsContainer.innerHTML = ''; // Clear previous results
 
-  if ((!strikesUsers || strikesUsers.length === 0) && (!clearedStrikesUsers || clearedStrikesUsers.length === 0) && (!streaksUsers || streaksUsers.length === 0)) {
-    resultsContainer.innerHTML = '<p>No strikes! Everyone is staying active!</p>';
+  const showStrikes = viewMode !== 'streaks';
+  const showStreaks = viewMode !== 'strikes';
+
+  const hasStrikes =
+    (strikesUsers && strikesUsers.length > 0) || (clearedStrikesUsers && clearedStrikesUsers.length > 0);
+  const hasStreaks = streaksUsers && streaksUsers.length > 0;
+
+  const renderedAny = (showStreaks && hasStreaks) || (showStrikes && hasStrikes);
+  if (!renderedAny) {
+    resultsContainer.innerHTML =
+      viewMode === 'streaks' ? '<p>No streaks yet.</p>' : '<p>No strikes! Everyone is staying active!</p>';
     return;
   }
 
-  const list = document.createElement('ul');
-  list.classList.add('strikes-users-list');
-
-  // Display users with current strikes
-  strikesUsers.forEach(user => {
-    const listItem = document.createElement('li');
-    listItem.classList.add('strikes-user-item');
-
-    // Avatar
-    const avatar = document.createElement('img');
-    avatar.classList.add('profile-pic');
-    avatar.src = user.avatar;
-    avatar.alt = `${user.username}'s profile picture`;
-
-    // Username (display "You" for current user, make clickable for others)
-    const username = document.createElement('p');
-    username.classList.add('strikes-username');
-
-    if (user.username === currentUsername) {
-      username.textContent = 'You';
-    } else {
-      const usernameLink = document.createElement('a');
-      usernameLink.href = `https://leetcode.com/${user.username}`;
-      usernameLink.textContent = user.username;
-      usernameLink.target = '_blank';
-      usernameLink.classList.add('username-link');
-      username.appendChild(usernameLink);
-    }
-
-    // "Clears Today" indicator (if user solved a problem today)
-    const clearsTodayIndicator = document.createElement('p');
-    clearsTodayIndicator.classList.add('clears-today');
-    if (user.clearsToday) {
-      clearsTodayIndicator.textContent = 'Clears Today';
-    }
-
-    // Strikes display with X emojis
-    const strikesDisplay = document.createElement('div');
-    strikesDisplay.classList.add('strikes-display');
-
-    const strikesText = document.createElement('p');
-    strikesText.classList.add('strikes-text');
-    strikesText.textContent = `Strike ${user.strikes}`;
-
-    const strikesEmojis = document.createElement('p');
-    strikesEmojis.classList.add('strikes-emojis');
-    strikesEmojis.textContent = '❌'.repeat(user.strikes);
-
-    strikesDisplay.appendChild(strikesText);
-    strikesDisplay.appendChild(strikesEmojis);
-
-    listItem.appendChild(avatar);
-    listItem.appendChild(username);
-    listItem.appendChild(clearsTodayIndicator);
-    listItem.appendChild(strikesDisplay);
-    list.appendChild(listItem);
-  });
-
-  // Display users who cleared their strikes yesterday (at the bottom)
-  if (clearedStrikesUsers && clearedStrikesUsers.length > 0) {
-    clearedStrikesUsers.forEach(user => {
-      const listItem = document.createElement('li');
-      listItem.classList.add('strikes-user-item', 'cleared-strikes');
-
-      // Avatar
-      const avatar = document.createElement('img');
-      avatar.classList.add('profile-pic');
-      avatar.src = user.avatar;
-      avatar.alt = `${user.username}'s profile picture`;
-
-      // Username (display "You" for current user, make clickable for others)
-      const username = document.createElement('p');
-      username.classList.add('strikes-username');
-
-      if (user.username === currentUsername) {
-        username.textContent = 'You';
-      } else {
-        const usernameLink = document.createElement('a');
-        usernameLink.href = `https://leetcode.com/${user.username}`;
-        usernameLink.textContent = user.username;
-        usernameLink.target = '_blank';
-        usernameLink.classList.add('username-link');
-        username.appendChild(usernameLink);
-      }
-
-      // Checkmark indicator
-      const checkmarkDisplay = document.createElement('div');
-      checkmarkDisplay.classList.add('cleared-display');
-
-      const checkmarkEmoji = document.createElement('p');
-      checkmarkEmoji.classList.add('checkmark-emoji');
-      checkmarkEmoji.textContent = '✅';
-
-      checkmarkDisplay.appendChild(checkmarkEmoji);
-
-      listItem.appendChild(avatar);
-      listItem.appendChild(username);
-      listItem.appendChild(checkmarkDisplay);
-      list.appendChild(listItem);
-    });
-  }
-
-  resultsContainer.appendChild(list);
-
-  // Display streaks section below strikes
-  if (streaksUsers && streaksUsers.length > 0) {
+  // Streaks section (shown above strikes)
+  if (showStreaks && hasStreaks) {
     const streaksHeader = document.createElement('h3');
     streaksHeader.classList.add('streaks-header');
     streaksHeader.textContent = 'Streaks';
@@ -335,6 +267,118 @@ export function displayStrikesUsers(strikesUsers, clearedStrikesUsers, streaksUs
 
     resultsContainer.appendChild(streaksList);
   }
+
+  // Strikes section
+  if (showStrikes && hasStrikes) {
+    const strikesHeader = document.createElement('h3');
+    strikesHeader.classList.add('streaks-header');
+    strikesHeader.textContent = 'Strikes';
+    resultsContainer.appendChild(strikesHeader);
+
+    const list = document.createElement('ul');
+    list.classList.add('strikes-users-list');
+
+    // Display users with current strikes
+    strikesUsers.forEach(user => {
+      const listItem = document.createElement('li');
+      listItem.classList.add('strikes-user-item');
+
+      // Avatar
+      const avatar = document.createElement('img');
+      avatar.classList.add('profile-pic');
+      avatar.src = user.avatar;
+      avatar.alt = `${user.username}'s profile picture`;
+
+      // Username (display "You" for current user, make clickable for others)
+      const username = document.createElement('p');
+      username.classList.add('strikes-username');
+
+      if (user.username === currentUsername) {
+        username.textContent = 'You';
+      } else {
+        const usernameLink = document.createElement('a');
+        usernameLink.href = `https://leetcode.com/${user.username}`;
+        usernameLink.textContent = user.username;
+        usernameLink.target = '_blank';
+        usernameLink.classList.add('username-link');
+        username.appendChild(usernameLink);
+      }
+
+      // "Clears Today" indicator (if user solved a problem today)
+      const clearsTodayIndicator = document.createElement('p');
+      clearsTodayIndicator.classList.add('clears-today');
+      if (user.clearsToday) {
+        clearsTodayIndicator.textContent = 'Clears Today';
+      }
+
+      // Strikes display with X emojis
+      const strikesDisplay = document.createElement('div');
+      strikesDisplay.classList.add('strikes-display');
+
+      const strikesText = document.createElement('p');
+      strikesText.classList.add('strikes-text');
+      strikesText.textContent = `Strike ${user.strikes}`;
+
+      const strikesEmojis = document.createElement('p');
+      strikesEmojis.classList.add('strikes-emojis');
+      strikesEmojis.textContent = '❌'.repeat(user.strikes);
+
+      strikesDisplay.appendChild(strikesText);
+      strikesDisplay.appendChild(strikesEmojis);
+
+      listItem.appendChild(avatar);
+      listItem.appendChild(username);
+      listItem.appendChild(clearsTodayIndicator);
+      listItem.appendChild(strikesDisplay);
+      list.appendChild(listItem);
+    });
+
+    // Display users who cleared their strikes yesterday (at the bottom)
+    if (clearedStrikesUsers && clearedStrikesUsers.length > 0) {
+      clearedStrikesUsers.forEach(user => {
+        const listItem = document.createElement('li');
+        listItem.classList.add('strikes-user-item', 'cleared-strikes');
+
+        // Avatar
+        const avatar = document.createElement('img');
+        avatar.classList.add('profile-pic');
+        avatar.src = user.avatar;
+        avatar.alt = `${user.username}'s profile picture`;
+
+        // Username (display "You" for current user, make clickable for others)
+        const username = document.createElement('p');
+        username.classList.add('strikes-username');
+
+        if (user.username === currentUsername) {
+          username.textContent = 'You';
+        } else {
+          const usernameLink = document.createElement('a');
+          usernameLink.href = `https://leetcode.com/${user.username}`;
+          usernameLink.textContent = user.username;
+          usernameLink.target = '_blank';
+          usernameLink.classList.add('username-link');
+          username.appendChild(usernameLink);
+        }
+
+        // Checkmark indicator
+        const checkmarkDisplay = document.createElement('div');
+        checkmarkDisplay.classList.add('cleared-display');
+
+        const checkmarkEmoji = document.createElement('p');
+        checkmarkEmoji.classList.add('checkmark-emoji');
+        checkmarkEmoji.textContent = '✅';
+
+        checkmarkDisplay.appendChild(checkmarkEmoji);
+
+        listItem.appendChild(avatar);
+        listItem.appendChild(username);
+        listItem.appendChild(checkmarkDisplay);
+        list.appendChild(listItem);
+      });
+    }
+
+    resultsContainer.appendChild(list);
+  }
 }
 
 /**
@@ -364,11 +408,14 @@ export function displayContestLeaderboard(contestData, weekStart, weekEnd, curre
   contestData.forEach((user, idx) => {
     const listItem = document.createElement('li');
     listItem.classList.add('contest-row');
+    if (idx < 3) {
+      listItem.classList.add(`rank-${idx + 1}`);
+    }
 
-    // Rank
+    // Rank (ordinal, matching the Global Rankings tab)
     const rank = document.createElement('p');
     rank.classList.add('contest-rank');
-    rank.textContent = `#${idx + 1}`;
+    rank.textContent = formatOrdinal(idx + 1);
 
     // Avatar
     const avatar = document.createElement('img');
@@ -391,26 +438,7 @@ export function displayContestLeaderboard(contestData, weekStart, weekEnd, curre
       username.appendChild(usernameLink);
     }
 
-    // Medal for top 3 positions
-    let medal = null;
-    if (idx === 0) {
-      medal = document.createElement('img');
-      medal.classList.add('medal-icon');
-      medal.src = '../gold-medal.png';
-      medal.alt = 'Gold medal';
-    } else if (idx === 1) {
-      medal = document.createElement('img');
-      medal.classList.add('medal-icon');
-      medal.src = '../silver-medal.png';
-      medal.alt = 'Silver medal';
-    } else if (idx === 2) {
-      medal = document.createElement('img');
-      medal.classList.add('medal-icon');
-      medal.src = '../bronze-medal.png';
-      medal.alt = 'Bronze medal';
-    }
-
-    // Problem indicators (circles showing difficulty)
+    // Problem indicators (one count chip per non-zero difficulty)
     const problemIndicators = document.createElement('div');
     problemIndicators.classList.add('contest-problem-indicators');
 
@@ -422,19 +450,29 @@ export function displayContestLeaderboard(contestData, weekStart, weekEnd, curre
       }
     });
 
-    // Create circles for each difficulty
-    let circleString = '';
-    for (let i = 0; i < difficultyCounts.Easy; i++) {
-      circleString += '🟢';
-    }
-    for (let i = 0; i < difficultyCounts.Medium; i++) {
-      circleString += '🟡';
-    }
-    for (let i = 0; i < difficultyCounts.Hard; i++) {
-      circleString += '🔴';
-    }
+    // Compact, bounded chips (e.g. "3E 2M 1H") instead of one mark per problem
+    const difficultyChips = [
+      ['Easy', 'E'],
+      ['Medium', 'M'],
+      ['Hard', 'H'],
+    ];
+    let chipCount = 0;
+    difficultyChips.forEach(([difficulty, letter]) => {
+      const count = difficultyCounts[difficulty];
+      if (count === 0) {
+        return;
+      }
 
-    problemIndicators.textContent = circleString || '—';
+      const chip = document.createElement('span');
+      chip.classList.add('contest-diff-chip', difficulty.toLowerCase());
+      chip.textContent = `${count}${letter}`;
+      problemIndicators.appendChild(chip);
+      chipCount++;
+    });
+
+    if (chipCount === 0) {
+      problemIndicators.textContent = '—';
+    }
 
     // Points
     const pointsContainer = document.createElement('div');
@@ -451,13 +489,16 @@ export function displayContestLeaderboard(contestData, weekStart, weekEnd, curre
     pointsContainer.appendChild(points);
     pointsContainer.appendChild(pointsLabel);
 
+    // Username + problem dots share a wrappable block so a long username
+    // pushes the dots to a new line instead of being truncated
+    const identity = document.createElement('div');
+    identity.classList.add('contest-identity');
+    identity.appendChild(username);
+    identity.appendChild(problemIndicators);
+
     listItem.appendChild(rank);
     listItem.appendChild(avatar);
-    listItem.appendChild(username);
-    if (medal) {
-      listItem.appendChild(medal);
-    }
-    listItem.appendChild(problemIndicators);
+    listItem.appendChild(identity);
     listItem.appendChild(pointsContainer);
 
     list.appendChild(listItem);
@@ -560,6 +601,9 @@ export function displayGlobalRankings(rankingsData, currentUsername) {
   rankedUsers.forEach((user, idx) => {
     const listItem = document.createElement('li');
     listItem.classList.add('global-rankings-row');
+    if (idx < 3) {
+      listItem.classList.add(`rank-${idx + 1}`);
+    }
 
     const left = document.createElement('div');
     left.classList.add('global-rankings-left');
@@ -591,14 +635,6 @@ export function displayGlobalRankings(rankingsData, currentUsername) {
     left.appendChild(spot);
     left.appendChild(avatar);
     left.appendChild(username);
-
-    if (idx < 3) {
-      const medal = document.createElement('img');
-      medal.classList.add('global-rankings-medal');
-      medal.src = idx === 0 ? '../gold-medal.png' : idx === 1 ? '../silver-medal.png' : '../bronze-medal.png';
-      medal.alt = idx === 0 ? 'Gold medal' : idx === 1 ? 'Silver medal' : 'Bronze medal';
-      left.appendChild(medal);
-    }
 
     const change = document.createElement('div');
     change.classList.add('global-rankings-change');
@@ -717,7 +753,8 @@ export async function displayACSubmissions(submissions, username, filterText = '
   const submissionWithDifficultyPromises = submissions.map(async (submission) => {
     const problem_data = await questionDifficulty(submission.titleSlug);
     const difficulty = problem_data.difficulty;
-    return { ...submission, difficulty };
+    const isPaidOnly = problem_data.isPaidOnly;
+    return { ...submission, difficulty, isPaidOnly };
   });
 
   // wait for fetching difficulties and then populate activity list with submissions in
@@ -774,6 +811,15 @@ export async function displayACSubmissions(submissions, username, filterText = '
       title.innerHTML = `${submission.username} solved `;
       title.appendChild(titleLink);
 
+      if (submission.isPaidOnly) {
+        const lock = document.createElement('span');
+        lock.classList.add('premium-lock');
+        lock.title = 'Premium problem';
+        lock.innerHTML =
+          '<svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="11" width="18" height="11" rx="2" ry="2"></rect><path d="M7 11V7a5 5 0 0 1 10 0v4"></path></svg>';
+        title.appendChild(lock);
+      }
+
       // problem difficulty
       const diff = document.createElement('p');
       diff.classList.add('submission-diff');
@@ -796,4 +842,125 @@ export async function displayACSubmissions(submissions, username, filterText = '
     resultsContainer.appendChild(list)
   });
 
+}
+
+/**
+ * Updates an element's text content when it exists.
+ * @param {string} id
+ * @param {string|number} value
+ */
+function setText(id, value) {
+  const el = document.getElementById(id);
+  if (el) {
+    el.textContent = value;
+  }
+}
+
+/**
+ * Renders the current user's solved-problem totals and per-difficulty breakdown
+ * in the Activity tab summary card.
+ * @param {{acSubmissionNum: {difficulty: string, count: number}[]}} stats - Result of getUserProblemStats
+ */
+export function displaySolvedStats(stats) {
+  const entries = (stats && stats.acSubmissionNum) || [];
+  const countFor = (difficulty) => {
+    const entry = entries.find((item) => item.difficulty === difficulty);
+    return entry ? entry.count : 0;
+  };
+
+  setText('summary-solved-total', countFor('All'));
+  setText('summary-easy', countFor('Easy'));
+  setText('summary-medium', countFor('Medium'));
+  setText('summary-hard', countFor('Hard'));
+}
+
+const HEATMAP_DAYS = 30;
+
+/**
+ * Renders the trailing 30-day activity heatmap. Each square is shaded by that
+ * day's submission count and reveals the exact count on hover.
+ * @param {{submissionCalendar: Object.<string, number>}} calendarData - Result of getUserCalendar
+ */
+export function displayActivityHeatmap(calendarData) {
+  const grid = document.getElementById('heatmap-grid');
+  const tooltip = document.getElementById('heatmap-tooltip');
+  if (!grid) {
+    return;
+  }
+
+  grid.innerHTML = '';
+  if (tooltip) {
+    tooltip.hidden = true;
+  }
+
+  const { cells, activeDays, maxCount } = buildActivityGrid(
+    calendarData ? calendarData.submissionCalendar : {},
+    { days: HEATMAP_DAYS }
+  );
+
+  setText('heatmap-active-days', `${activeDays}/${HEATMAP_DAYS}`);
+  setText('heatmap-axis-start', cells.length ? formatAxisDate(cells[0].date) : '');
+
+  const lastIndex = cells.length - 1;
+
+  cells.forEach((cell, index) => {
+    const cellEl = document.createElement('span');
+    cellEl.classList.add('heat-cell', `heat-level-${getActivityLevel(cell.count, maxCount)}`);
+
+    if (index === lastIndex) {
+      cellEl.classList.add('is-today');
+      if (cell.count > 0) {
+        const check = document.createElement('span');
+        check.classList.add('heat-cell-check');
+        check.textContent = '✓';
+        cellEl.appendChild(check);
+      }
+    }
+
+    attachHeatmapTooltip(cellEl, cell, tooltip);
+    grid.appendChild(cellEl);
+  });
+}
+
+/**
+ * Shows the day's submission count in a floating tooltip on hover.
+ * @param {HTMLElement} cellEl
+ * @param {{date: string, count: number}} cell
+ * @param {HTMLElement|null} tooltip
+ */
+function attachHeatmapTooltip(cellEl, cell, tooltip) {
+  if (!tooltip) {
+    return;
+  }
+
+  cellEl.addEventListener('mouseenter', () => {
+    tooltip.textContent = formatHeatmapTooltip(cell);
+    tooltip.hidden = false;
+    positionTooltip(tooltip, cellEl);
+  });
+
+  cellEl.addEventListener('mouseleave', () => {
+    tooltip.hidden = true;
+  });
+}
+
+/**
+ * Positions the tooltip above the hovered cell, clamped to the card and flipped
+ * below when there is no room above.
+ * @param {HTMLElement} tooltip
+ * @param {HTMLElement} cellEl
+ */
+function positionTooltip(tooltip, cellEl) {
+  const panel = tooltip.offsetParent;
+  if (!panel) {
+    return;
+  }
+
+  const maxLeft = panel.clientWidth - tooltip.offsetWidth - 4;
+  const centeredLeft = cellEl.offsetLeft + cellEl.offsetWidth / 2 - tooltip.offsetWidth / 2;
+  tooltip.style.left = `${Math.max(4, Math.min(centeredLeft, maxLeft))}px`;
+
+  const above = cellEl.offsetTop - tooltip.offsetHeight - 6;
+  tooltip.style.top =
+    above >= 0 ? `${above}px` : `${cellEl.offsetTop + cellEl.offsetHeight + 6}px`;
 }
