@@ -1,24 +1,24 @@
 # Caching Implementation
 
 ## Overview
-This extension now implements a comprehensive caching system using `chrome.storage.local` with TTL (Time To Live) support. This significantly improves performance by reducing redundant API calls to LeetCode's GraphQL API.
+The extension caches LeetCode GraphQL results in `chrome.storage.local` with TTL
+(Time To Live) support, so reopening the popup is instant and repeat requests
+are avoided. Every query goes through `utils/gqlClient.js` and
+`cache.remember(...)`, which also collapses duplicate concurrent requests.
 
-## Cache Configuration
-
-### TTL (Time To Live) Values
-- **Profile Pictures**: 24 hours (86,400,000 ms)
-  - Profile pictures rarely change
-- **User Problem Stats**: 2 hours (7,200,000 ms)
-  - Stats change slowly as users solve problems
-- **Recent Submissions**: 10 minutes (600,000 ms)
-  - Most dynamic data, needs frequent updates
-- **Weekly Leaderboard / Contest**: 30 minutes (1,800,000 ms)
-  - Updates as new submissions come in across the week
+## TTL (Time To Live) Values
+- **Profile pictures**: 7 days — rarely change; Refresh All clears them
+- **Problem difficulty**: 24 hours — immutable, so cached long-lived
+- **User problem stats**: 1 hour — change slowly as users solve problems
+- **Global ranking**: 1 hour
+- **Recent submissions**: 10 minutes — the most dynamic data
+- **Contest / weekly leaderboard**: 30 minutes
+- **Strikes / streaks**: 10 minutes, capped so it never crosses local midnight
 
 ## How It Works
 
 ### Cache Structure
-Each cached entry is stored with the following structure:
+Each entry is stored as:
 ```javascript
 {
   value: <cached_data>,
@@ -28,96 +28,91 @@ Each cached entry is stored with the following structure:
 ```
 
 ### Cache Keys
-- Profile pictures: `cache_profile_pic_{username}`
+- Profile picture: `cache_profile_pic_{username}`
 - User stats: `cache_user_stats_{username}`
-- Submissions: `cache_submissions_{username}_{limit}`
+- Recent submissions: `cache_submissions_{username}` (limit-independent)
+- Problem ranking: `cache_problem_ranking_{username}`
+- Submission calendar: `cache_user_calendar_{username}`
+- Problem difficulty: `cache_difficulty_{titleSlug}`
+- Strikes batch: `cache_strikes_{users}_{maxStrikes}_{date}`
+- Contest batch: `cache_contest_{users}_{weekStart}`
+
+`recentAcSubmissionList` is clamped to 20 rows by LeetCode, so submissions are
+fetched once per user at limit 20 and sliced for the Activity (5), Contest (20)
+and Streaks (30) views — one cache entry serves all three instead of three keys.
 
 ### Cache Operations
+1. **Get**: retrieve data if present and not expired
+2. **Set**: store data with an expiration timestamp
+3. **Has**: check whether a valid entry exists
+4. **Delete**: remove a specific entry
+5. **Clear**: remove every `cache_*` entry
+6. **CleanExpired**: remove expired entries (runs on popup open)
+7. **Remember**: return the cached value, or run a loader once and cache it.
+   Concurrent callers for the same key share a single loader call, so a cold
+   cache never issues duplicate requests.
 
-1. **Get**: Retrieves data from cache if not expired
-2. **Set**: Stores data with an expiration timestamp
-3. **Has**: Checks if a key exists and is valid
-4. **Delete**: Removes a specific cache entry
-5. **Clear**: Removes all cache entries
-6. **CleanExpired**: Removes expired entries (runs on popup open)
+## Request Pipeline
+- **`utils/gqlClient.js`** is the only place that POSTs to LeetCode. It caps
+  total in-flight requests at 6 (FIFO — work enqueued first is served first, so
+  the activity feed and self summary beat the deferred tabs) and retries
+  transient `429`/`5xx` responses with exponential backoff.
+- **`utils/concurrency.js`** provides `mapLimit` for bounded per-fan-out work.
+  Per-user fetches run in parallel; anything with a shared storage write
+  (strikes batch, weekly contest store) fetches in parallel then persists
+  sequentially, so the merges stay race-free.
+- **Priority order**: on open, the profile header, self summary and Activity
+  feed are started first; Contest / Leaderboard / Streaks / Global Rankings then
+  load concurrently.
 
 ## Benefits
 
 ### Performance Improvements
-- **Faster Loading**: Cached data loads instantly without network requests
-- **Reduced API Load**: Fewer requests to LeetCode's servers
-- **Better UX**: Immediate display of data when reopening the extension
+- **Faster loading**: cached data renders instantly; difficulty colors no longer
+  refetch on every Activity render or filter keystroke
+- **Reduced API load**: fewer requests to LeetCode's servers, with a hard
+  concurrency ceiling to stay clear of rate limiting
 
 ### API Call Reduction
-**Before Caching** (with 5 friends):
-- Opening extension: ~36 API calls (6 users × 6 data points)
-- Tab switching: 6-12 additional calls
+**Before** (cold open, 5 friends): ~36 calls, including the same recent
+submissions fetched three times per user and every problem's difficulty
+refetched on each render.
 
-**After Caching** (subsequent opens within TTL):
-- Opening extension: 0 API calls (if cache is warm)
-- Tab switching: 0 additional calls
+**After** (cold open, 5 friends): ~1 submissions call per user, difficulty
+fetched once per problem per day, and duplicate self-stats / profile-pic
+requests collapsed into one.
+
+**Warm cache** (within TTL): 0 API calls.
 
 ## Cache Maintenance
 
 ### Automatic Cleanup
-- Expired entries are automatically cleaned when:
-  - The popup is opened (`DOMContentLoaded` event)
-  - A cache entry is accessed but found to be expired
+Expired entries are removed when the popup opens (`DOMContentLoaded`) and when
+an expired entry is read.
 
 ### Manual Cache Management
-To manually clear the cache (useful for debugging):
 ```javascript
 import cache from './utils/cache.js';
 
-// Clear all cache
-await cache.clear();
+await cache.clear();                       // every cache entry
 
-// Clear specific user's data
 await cache.delete('profile_pic_username');
 await cache.delete('user_stats_username');
-await cache.delete('submissions_username_20');
+await cache.delete('submissions_username'); // and legacy submissions_username_{limit}
 ```
 
 ## Update Timer
-
-Each page (Activity, Leaderboard, Streaks) displays a small timer showing when the cached data will expire and refresh:
-
-- **"Updates in 9m 45s"** - Real-time countdown to cache expiration
-- **"Updates on next open"** - When no cache exists yet
-- **"Updating..."** - When cache has expired
-
-This gives users transparency about when data will be refreshed.
-
-See [UPDATE_TIMER.md](UPDATE_TIMER.md) for detailed information about the timer feature.
-
-## Testing
-
-### Verify Caching Works
-1. Open the extension (first time will fetch from API)
-2. Check browser console for "Cache miss" messages
-3. Observe the update timer showing countdown (e.g., "Updates in 9m 45s")
-4. Close and reopen the extension immediately
-5. Check console for "Cache hit" messages
-6. Verify data loads instantly and timer shows time remaining
-
-### Console Messages
-- `Cache miss for [type]: [username], fetching from API` - Data not in cache, fetching fresh
-- `Cache hit for [type]: [username]` - Data loaded from cache
-- `Cleaned up X expired cache entries` - Automatic cleanup on popup open
+Each page shows a shared countdown to the next scheduled refresh. See
+[UPDATE_TIMER.md](UPDATE_TIMER.md).
 
 ## Implementation Files
-
-- `utils/cache.js` - Core caching utility
-- `GQLQueries/getUserProfilePic.js` - Profile picture caching
-- `GQLQueries/getUserProblemStats.js` - User stats caching
-- `GQLQueries/recentACSubmissions.js` - Submissions caching
-- `popup/popup.js` - Cache cleanup integration
+- `utils/cache.js` — core caching + `remember` coalescing
+- `utils/gqlClient.js` — GraphQL transport, concurrency cap, retry/backoff
+- `utils/concurrency.js` — bounded `mapLimit`
+- `GQLQueries/*.js` — per-query caching
+- `popup/popup.js` — cache cleanup and load orchestration
 
 ## Future Enhancements
-
-Potential improvements:
-1. **Background Refresh**: Use `chrome.alarms` to refresh cache periodically
-2. **Cache Size Limits**: Implement cache eviction when storage approaches limits
-3. **Stale-While-Revalidate**: Show cached data immediately while fetching fresh data in background
-4. **Per-User Settings**: Allow users to configure cache TTL values
-5. **Cache Statistics**: Display cache hit/miss ratio in settings
+1. **Cache size limits**: evict when storage approaches its quota
+2. **Stale-while-revalidate**: show cached data while refreshing in the background
+3. **Cache statistics**: expose hit/miss counts in settings

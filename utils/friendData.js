@@ -7,12 +7,16 @@
  *  - TTL cache entries (`cache_*`) from the GQLQueries modules
  *  - `weeklySubmissions[username]`  (contest accumulation)
  *  - `previousStreaks[username]`    (streak comparison)
+ *  - `previousStreakDates[username]` (day the saved streak counts through)
  *  - `dailyActivityLog[username]`   (immutable per-day activity)
  *  - `problemRankSnapshots.{lastViewed,byDate}[username]`
+ *  - `solvedSnapshots[username]`    (per-day solved totals)
  */
 import { removeUserWeeklySubmissions } from './contestUtils.js';
+import { removeUserSolvedSnapshots } from './solvedSnapshots.js';
 
 const PREVIOUS_STREAKS_KEY = 'previousStreaks';
+const PREVIOUS_STREAK_DATES_KEY = 'previousStreakDates';
 const DAILY_ACTIVITY_LOG_KEY = 'dailyActivityLog';
 const PROBLEM_RANK_SNAPSHOTS_KEY = 'problemRankSnapshots';
 
@@ -31,9 +35,10 @@ function storageRemove(keys) {
 /**
  * Cache keys belonging to a single user.
  *
- * Exact keys are matched exactly; submission keys embed the limit
- * (`submissions_<user>_<limit>`) so they're matched with a trailing underscore
- * to avoid a shorter name (e.g. "bob") deleting a longer one's ("bobby") data.
+ * Exact keys are matched exactly. Submission keys are matched by their legacy
+ * `submissions_<user>_<limit>` prefix (for leftover entries) as well as the
+ * current limit-independent `submissions_<user>` key; the trailing underscore
+ * avoids a shorter name (e.g. "bob") deleting a longer one's ("bobby") data.
  * @param {string[]} allKeys - Every key currently in chrome.storage.local
  * @param {string} username
  * @returns {string[]}
@@ -43,6 +48,7 @@ export function getUserCacheKeys(allKeys, username) {
     `cache_profile_pic_${username}`,
     `cache_user_stats_${username}`,
     `cache_problem_ranking_${username}`,
+    `cache_submissions_${username}`,
   ]);
   const submissionsPrefix = `cache_submissions_${username}_`;
 
@@ -100,7 +106,9 @@ export async function removeFriendData(username) {
   await Promise.all([
     removeUserWeeklySubmissions(username),
     removeFromObjectStore(PREVIOUS_STREAKS_KEY, username),
+    removeFromObjectStore(PREVIOUS_STREAK_DATES_KEY, username),
     removeFromObjectStore(DAILY_ACTIVITY_LOG_KEY, username),
     removeFromRankSnapshots(username),
+    removeUserSolvedSnapshots(username),
   ]);
 }

@@ -81,3 +81,55 @@ describe('getTTLUntilMidnight', () => {
     expect(getTTLUntilMidnight('UTC')).toBeGreaterThanOrEqual(TTL.STRIKES);
   });
 });
+
+describe('remember', () => {
+  it('returns a cached value without invoking the loader', async () => {
+    await cache.set('remember_hit', 42, 1000);
+    const loader = vi.fn();
+
+    await expect(cache.remember('remember_hit', 1000, loader)).resolves.toBe(42);
+    expect(loader).not.toHaveBeenCalled();
+  });
+
+  it('runs the loader once on a miss and caches the result', async () => {
+    const loader = vi.fn().mockResolvedValue('value');
+
+    await expect(cache.remember('remember_miss', 1000, loader)).resolves.toBe('value');
+    await expect(cache.remember('remember_miss', 1000, loader)).resolves.toBe('value');
+    expect(loader).toHaveBeenCalledTimes(1);
+  });
+
+  it('coalesces concurrent misses into a single loader call', async () => {
+    let calls = 0;
+    const loader = async () => {
+      calls += 1;
+      await Promise.resolve();
+      return 'shared';
+    };
+
+    const [a, b] = await Promise.all([
+      cache.remember('remember_concurrent', 1000, loader),
+      cache.remember('remember_concurrent', 1000, loader),
+    ]);
+
+    expect(calls).toBe(1);
+    expect(a).toBe('shared');
+    expect(b).toBe('shared');
+  });
+
+  it('does not cache a null result', async () => {
+    const loader = vi.fn().mockResolvedValue(null);
+
+    await expect(cache.remember('remember_null', 1000, loader)).resolves.toBeNull();
+    await expect(cache.remember('remember_null', 1000, loader)).resolves.toBeNull();
+    expect(loader).toHaveBeenCalledTimes(2);
+  });
+
+  it('propagates a loader error and leaves nothing cached', async () => {
+    const loader = vi.fn().mockRejectedValue(new Error('boom'));
+
+    await expect(cache.remember('remember_error', 1000, loader)).rejects.toThrow('boom');
+    await expect(cache.remember('remember_error', 1000, loader)).rejects.toThrow('boom');
+    expect(loader).toHaveBeenCalledTimes(2);
+  });
+});

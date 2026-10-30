@@ -3,6 +3,7 @@ import {
   getPointsForDifficulty,
   submissionKey,
   mergeSubmissions,
+  dedupeProblemsBySlug,
   getCurrentWeekBounds,
   isInCurrentWeek,
   filterSubmissionsInWeek,
@@ -19,6 +20,25 @@ const readStoredSubmissions = async (username) => {
   );
   return result[WEEKLY_SUBMISSIONS_STORE_KEY]?.[username]?.submissions ?? null;
 };
+
+describe('dedupeProblemsBySlug', () => {
+  it('keeps one entry per problem, using the earliest solve', () => {
+    const result = dedupeProblemsBySlug([
+      sub('two-sum', 200),
+      sub('two-sum', 100),
+      sub('add-two-numbers', 150),
+    ]);
+
+    expect(result.map((s) => [s.titleSlug, s.timestamp])).toEqual([
+      ['two-sum', 100],
+      ['add-two-numbers', 150],
+    ]);
+  });
+
+  it('returns an empty list for no submissions', () => {
+    expect(dedupeProblemsBySlug([])).toEqual([]);
+  });
+});
 
 describe('getPointsForDifficulty', () => {
   it('maps each difficulty to its point value', () => {

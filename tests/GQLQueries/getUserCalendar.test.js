@@ -48,7 +48,7 @@ describe('getUserCalendar', () => {
   });
 
   it('returns an empty calendar on an HTTP error', async () => {
-    const fetchMock = mockFetch({}, { ok: false, status: 500 });
+    const fetchMock = mockFetch({}, { ok: false, status: 400 });
 
     await expect(getUserCalendar('test_user_b')).resolves.toEqual(EMPTY_CALENDAR);
     expect(fetchMock).toHaveBeenCalledTimes(1);

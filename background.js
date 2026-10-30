@@ -2,8 +2,8 @@ import { loadStrikesUsersData } from './utils/streakUtils.js';
 
 const ALARM_NAME = 'streak-badge-refresh';
 const REFRESH_PERIOD_MINUTES = 30;
-const BADGE_COLOR = '#ff9f0a';
-const BADGE_TEXT_COLOR = '#1e1e1e';
+const BADGE_COLOR = '#000000';
+const BADGE_TEXT_COLOR = '#ffffff';
 
 function getStoredSettings() {
   return new Promise((resolve) => {

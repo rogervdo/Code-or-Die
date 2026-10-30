@@ -1,6 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import { removeFriendData, getUserCacheKeys } from '../../utils/friendData.js';
 import { WEEKLY_SUBMISSIONS_STORE_KEY } from '../../utils/contestUtils.js';
+import { SOLVED_SNAPSHOTS_KEY } from '../../utils/solvedSnapshots.js';
 
 const setStorage = (items) => new Promise((resolve) => chrome.storage.local.set(items, resolve));
 const getStorage = (keys) => new Promise((resolve) => chrome.storage.local.get(keys, resolve));
@@ -30,6 +31,7 @@ async function seed() {
       bobby: { weekStart: '2024-06-17', submissions: [{ titleSlug: 'c', timestamp: 3 }] },
     },
     previousStreaks: { alice: 2, bob: 5, bobby: 1 },
+    previousStreakDates: { alice: '2024-06-18', bob: '2024-06-18', bobby: '2024-06-18' },
     dailyActivityLog: {
       alice: { '2024-06-18': true },
       bob: { '2024-06-18': true },
@@ -41,6 +43,11 @@ async function seed() {
         bob: { '2024-06-18': 200 },
         bobby: { '2024-06-18': 300 },
       },
+    },
+    [SOLVED_SNAPSHOTS_KEY]: {
+      alice: { '2024-06-18': { All: 10, Easy: 6, Medium: 3, Hard: 1 } },
+      bob: { '2024-06-18': { All: 20, Easy: 10, Medium: 7, Hard: 3 } },
+      bobby: { '2024-06-18': { All: 30, Easy: 15, Medium: 10, Hard: 5 } },
     },
   });
 }
@@ -87,7 +94,7 @@ describe('removeFriendData', () => {
     }
   });
 
-  it('removes the friend from weekly submissions, streaks, activity log, and rank snapshots', async () => {
+  it('removes the friend from weekly submissions, streaks, activity log, rank and solved snapshots', async () => {
     await seed();
     await removeFriendData('bob');
 
@@ -95,9 +102,11 @@ describe('removeFriendData', () => {
 
     expect(all[WEEKLY_SUBMISSIONS_STORE_KEY].bob).toBeUndefined();
     expect(all.previousStreaks.bob).toBeUndefined();
+    expect(all.previousStreakDates.bob).toBeUndefined();
     expect(all.dailyActivityLog.bob).toBeUndefined();
     expect(all.problemRankSnapshots.lastViewed.bob).toBeUndefined();
     expect(all.problemRankSnapshots.byDate.bob).toBeUndefined();
+    expect(all[SOLVED_SNAPSHOTS_KEY].bob).toBeUndefined();
   });
 
   it('leaves other friends (including prefix-collision names) untouched', async () => {
@@ -115,9 +124,13 @@ describe('removeFriendData', () => {
     expect(all[WEEKLY_SUBMISSIONS_STORE_KEY].bobby).toBeDefined();
     expect(all.previousStreaks.alice).toBe(2);
     expect(all.previousStreaks.bobby).toBe(1);
+    expect(all.previousStreakDates.alice).toBe('2024-06-18');
+    expect(all.previousStreakDates.bobby).toBe('2024-06-18');
     expect(all.dailyActivityLog.alice).toBeDefined();
     expect(all.problemRankSnapshots.lastViewed.alice).toBe(100);
     expect(all.problemRankSnapshots.byDate.bobby).toBeDefined();
+    expect(all[SOLVED_SNAPSHOTS_KEY].alice).toBeDefined();
+    expect(all[SOLVED_SNAPSHOTS_KEY].bobby).toBeDefined();
   });
 
   it('leaves global keys untouched', async () => {
@@ -138,6 +151,7 @@ describe('removeFriendData', () => {
     expect(all.cache_profile_pic_bob).toBeDefined();
     expect(all.previousStreaks.bob).toBe(5);
     expect(all[WEEKLY_SUBMISSIONS_STORE_KEY].bob).toBeDefined();
+    expect(all[SOLVED_SNAPSHOTS_KEY].bob).toBeDefined();
   });
 
   it('ignores an empty username', async () => {

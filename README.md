@@ -13,6 +13,7 @@ See how many strikes (days in a row) your friends have without doing leetcodes
 - **Activity Feed**: View recent submissions from you and your friends
 - **Leaderboard**: Track problem counts across different difficulty levels
 - **Weekly Leaderboard**: See who's solved the most problems this week
+- **Daily Progress**: +X badges on every leaderboard view show how many problems each person solved today
 - **Streaks & Strikes**: Track consecutive days solving (streaks) and days missed (strikes) — with a setting to show either or both
 - **Smart Caching**: Fast loading with intelligent caching system
 

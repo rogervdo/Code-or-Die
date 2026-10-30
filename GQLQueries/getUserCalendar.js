@@ -1,4 +1,7 @@
 import cache, { TTL } from '../utils/cache.js';
+import { gqlRequest } from '../utils/gqlClient.js';
+
+const EMPTY_CALENDAR = { streak: 0, totalActiveDays: 0, activeYears: [], submissionCalendar: {} };
 
 /**
  * Fetches a user's submission calendar, the same data source behind LeetCode's
@@ -9,17 +12,9 @@ import cache, { TTL } from '../utils/cache.js';
  * @returns {Promise<object>} - { streak, totalActiveDays, activeYears, submissionCalendar }
  */
 const getUserCalendar = async (username) => {
-  const cacheKey = `user_calendar_${username}`;
-  const cachedData = await cache.get(cacheKey);
-
-  if (cachedData !== null) {
-    console.log(`Cache hit for user calendar: ${username}`);
-    return cachedData;
-  }
-
-  console.log(`Cache miss for user calendar: ${username}, fetching from API`);
-
-  const query = `
+  try {
+    return await cache.remember(`user_calendar_${username}`, TTL.USER_STATS, async () => {
+      const query = `
     query userProfileCalendar($username: String!) {
         matchedUser(username: $username) {
             userCalendar {
@@ -31,55 +26,34 @@ const getUserCalendar = async (username) => {
         }
     }`;
 
-  const variables = {
-    username,
-  };
+      const result = await gqlRequest(query, { username });
 
-  try {
-    const response = await fetch('https://leetcode.com/graphql', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({ query, variables }),
+      if (result.errors) {
+        throw new Error(result.errors.map((error) => error.message).join(', '));
+      }
+
+      const calendar = result.data?.matchedUser?.userCalendar;
+      if (!calendar) {
+        return { ...EMPTY_CALENDAR };
+      }
+
+      let submissionCalendar = {};
+      try {
+        submissionCalendar = JSON.parse(calendar.submissionCalendar || '{}');
+      } catch (error) {
+        console.error('Error parsing submission calendar:', error);
+      }
+
+      return {
+        streak: calendar.streak ?? 0,
+        totalActiveDays: calendar.totalActiveDays ?? 0,
+        activeYears: calendar.activeYears ?? [],
+        submissionCalendar,
+      };
     });
-
-    if (!response.ok) {
-      throw new Error(`HTTP error! status: ${response.status}`);
-    }
-
-    const result = await response.json();
-
-    if (result.errors) {
-      throw new Error(result.errors.map((error) => error.message).join(', '));
-    }
-
-    const calendar = result.data?.matchedUser?.userCalendar;
-    if (!calendar) {
-      return { streak: 0, totalActiveDays: 0, activeYears: [], submissionCalendar: {} };
-    }
-
-    let submissionCalendar = {};
-    try {
-      submissionCalendar = JSON.parse(calendar.submissionCalendar || '{}');
-    } catch (error) {
-      console.error('Error parsing submission calendar:', error);
-    }
-
-    const data = {
-      streak: calendar.streak ?? 0,
-      totalActiveDays: calendar.totalActiveDays ?? 0,
-      activeYears: calendar.activeYears ?? [],
-      submissionCalendar,
-    };
-
-    // Cache the result with 1-hour TTL, matching user stats
-    await cache.set(cacheKey, data, TTL.USER_STATS);
-
-    return data;
   } catch (error) {
     console.error('Error fetching user calendar:', error);
-    return { streak: 0, totalActiveDays: 0, activeYears: [], submissionCalendar: {} };
+    return { ...EMPTY_CALENDAR };
   }
 };
 

@@ -13,6 +13,20 @@ import {
   formatHeatmapTooltip,
   getActivityLevel,
 } from '../utils/activityHeatmap.js';
+import { mapLimit } from '../utils/concurrency.js';
+
+/**
+ * Adds the staggered reveal to a results container that is currently showing
+ * its skeleton, so the freshly fetched rows cascade in. Re-renders that are not
+ * replacing a skeleton (filtering, silent refreshes) keep the list still.
+ * @param {HTMLElement} container
+ */
+function revealIfLoaded(container) {
+  if (!container) {
+    return;
+  }
+  container.classList.toggle('cascade', !!container.querySelector('.skeleton-list'));
+}
 
 /**
  * Displays the friends list.
@@ -65,8 +79,9 @@ export function displayFriendsList(friends) {
  * @param {string} username - The current username.
  * @param {number} diff - The difficulty level (0: All, 1: Easy, 2: Medium, 3: Hard, 4: Weekly).
  *                         4 (Weekly) is a special case, not a difficulty.
+ * @param {Object} solvedDeltas - Map of username to solved-today deltas (see utils/solvedSnapshots.js).
  */
-export function displayLeaderboard(leaderboardStats, weeklyStats, username, diff) {
+export function displayLeaderboard(leaderboardStats, weeklyStats, username, diff, solvedDeltas = {}) {
   // choose between default leaderboard stats or weekly stats
   if (diff === 4) leaderboardStats = weeklyStats;
   // sort by problems solved
@@ -79,6 +94,7 @@ export function displayLeaderboard(leaderboardStats, weeklyStats, username, diff
 
   // create container
   const resultsContainer = document.getElementById('leaderboard-results');
+  revealIfLoaded(resultsContainer);
   resultsContainer.innerHTML = ''; // Clear previous results
 
   if (!leaderboardStats || leaderboardStats.length === 0) {
@@ -137,6 +153,19 @@ export function displayLeaderboard(leaderboardStats, weeklyStats, username, diff
       solvedContainer.appendChild(solved);
       solvedContainer.appendChild(solvedLabel);
 
+      // Solved today (since the last prior-day snapshot), when there is one
+      const delta = solvedDeltas ? solvedDeltas[stat.username] : null;
+      const deltaKey = ['All', 'Easy', 'Medium', 'Hard'][diff] ?? 'All';
+      if (delta && delta[deltaKey] > 0) {
+        const solvedDelta = document.createElement('span');
+        solvedDelta.classList.add('stat-row-delta');
+        solvedDelta.textContent = `+${delta[deltaKey]}`;
+        solvedDelta.title = delta.isPriorDay
+          ? 'Solved today'
+          : `Solved since ${formatSnapshotDate(delta.referenceDate)}`;
+        solvedContainer.appendChild(solvedDelta);
+      }
+
       listItem.appendChild(rank);
       listItem.appendChild(avatar);
       listItem.appendChild(username);
@@ -181,12 +210,13 @@ export function displayStrikesUsers(
 
   // Reflect the streak on the toolbar icon badge
   if (typeof chrome !== 'undefined' && chrome.action?.setBadgeText) {
-    chrome.action.setBadgeBackgroundColor({ color: '#ff9f0a' });
-    chrome.action.setBadgeTextColor?.({ color: '#1e1e1e' });
+    chrome.action.setBadgeBackgroundColor({ color: '#000000' });
+    chrome.action.setBadgeTextColor?.({ color: '#ffffff' });
     chrome.action.setBadgeText({ text: streakCount > 0 ? String(streakCount) : '' });
   }
 
   const resultsContainer = document.getElementById('strikes-list');
+  revealIfLoaded(resultsContainer);
   resultsContainer.innerHTML = ''; // Clear previous results
 
   const showStrikes = viewMode !== 'streaks';
@@ -391,6 +421,7 @@ export function displayStrikesUsers(
 export function displayContestLeaderboard(contestData, weekStart, weekEnd, currentUsername) {
   const resultsContainer = document.getElementById('contest-results');
   const weekDatesContainer = document.getElementById('contest-week-dates');
+  revealIfLoaded(resultsContainer);
   resultsContainer.innerHTML = ''; // Clear previous results
 
   // Display week dates
@@ -583,6 +614,7 @@ function getNoChangeTitle(user) {
  */
 export function displayGlobalRankings(rankingsData, currentUsername) {
   const resultsContainer = document.getElementById('global-rankings-results');
+  revealIfLoaded(resultsContainer);
   resultsContainer.innerHTML = '';
 
   if (!rankingsData || rankingsData.length === 0) {
@@ -733,11 +765,10 @@ let currentRenderID = 0;
 
 export async function displayACSubmissions(submissions, username, filterText = '') {
   const resultsContainer = document.getElementById('graphql-results');
+  revealIfLoaded(resultsContainer);
 
   // Increment render ID to invalidate previous renders
   const renderID = ++currentRenderID;
-
-  resultsContainer.innerHTML = ''; // Clear previous results
 
   if (!submissions || submissions.length === 0) {
     resultsContainer.innerHTML = '<p>No submissions found.</p>';
@@ -750,16 +781,12 @@ export async function displayACSubmissions(submissions, username, filterText = '
 
 
   // Fetch all difficulties
-  const submissionWithDifficultyPromises = submissions.map(async (submission) => {
+  mapLimit(submissions, 6, async (submission) => {
     const problem_data = await questionDifficulty(submission.titleSlug);
     const difficulty = problem_data.difficulty;
     const isPaidOnly = problem_data.isPaidOnly;
     return { ...submission, difficulty, isPaidOnly };
-  });
-
-  // wait for fetching difficulties and then populate activity list with submissions in
-  // order of most recent
-  Promise.all(submissionWithDifficultyPromises).then((submissionsWithDiff) => {
+  }).then((submissionsWithDiff) => {
     // Check if this render is still valid (not superseded by a newer search)
     if (renderID !== currentRenderID) {
       return; // Discard outdated results

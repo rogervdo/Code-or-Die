@@ -3,6 +3,12 @@
  * Provides TTL-based caching using chrome.storage.local
  */
 
+/**
+ * In-flight loaders, keyed by prefixed cache key. Lets concurrent callers for
+ * the same miss share a single loader invocation instead of stampeding.
+ */
+const inflight = new Map();
+
 class Cache {
     constructor() {
         this.prefix = 'cache_';
@@ -79,6 +85,43 @@ class Cache {
                 resolve(cacheEntry.value);
             });
         });
+    }
+
+    /**
+     * Returns the cached value for a key, or runs `loader` once to produce it.
+     * Concurrent callers for the same key share a single loader invocation, so a
+     * cold cache never issues duplicate requests. The loader's result is cached
+     * when it is not null/undefined.
+     * @param {string} key - Cache key
+     * @param {number} ttlMs - TTL to store the resolved value with
+     * @param {Function} loader - Async factory invoked on a miss
+     * @returns {Promise<any>}
+     */
+    async remember(key, ttlMs, loader) {
+        const cached = await this.get(key);
+        if (cached !== null && cached !== undefined) {
+            return cached;
+        }
+
+        const cacheKey = this.getCacheKey(key);
+        if (inflight.has(cacheKey)) {
+            return inflight.get(cacheKey);
+        }
+
+        const promise = (async () => {
+            try {
+                const value = await loader();
+                if (value !== null && value !== undefined) {
+                    await this.set(key, value, ttlMs);
+                }
+                return value;
+            } finally {
+                inflight.delete(cacheKey);
+            }
+        })();
+
+        inflight.set(cacheKey, promise);
+        return promise;
     }
 
     /**
@@ -219,13 +262,14 @@ class Cache {
 
 // TTL constants (in milliseconds)
 export const TTL = {
-    PROFILE_PIC: 24 * 60 * 60 * 1000,      // 24 hours
+    PROFILE_PIC: 7 * 24 * 60 * 60 * 1000,  // 7 days
     USER_STATS: 60 * 60 * 1000,            // 1 hour
     SUBMISSIONS: 10 * 60 * 1000,            // 10 minutes
     DAILY_LEADERBOARD: 5 * 60 * 1000,       // 5 minutes
     CONTEST: 30 * 60 * 1000,                // 30 minutes
     STRIKES: 30 * 60 * 1000,                // 30 minutes
-    GLOBAL_RANKING: 60 * 60 * 1000          // 1 hour
+    GLOBAL_RANKING: 60 * 60 * 1000,         // 1 hour
+    PROBLEM_DIFFICULTY: 24 * 60 * 60 * 1000 // 24 hours (difficulty is immutable)
 };
 
 /**

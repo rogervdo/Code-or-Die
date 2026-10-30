@@ -60,6 +60,26 @@ export function mergeSubmissions(existing, incoming) {
 }
 
 /**
+ * Collapses a week's submissions to one entry per problem, keeping the earliest
+ * solve. Contest scoring counts distinct problems solved in the week, so
+ * re-solving a problem doesn't earn a second time.
+ * @param {object[]} submissions
+ * @returns {object[]} One entry per titleSlug, ordered by earliest solve
+ */
+export function dedupeProblemsBySlug(submissions) {
+  const bySlug = new Map();
+
+  for (const submission of submissions) {
+    const existing = bySlug.get(submission.titleSlug);
+    if (!existing || submission.timestamp < existing.timestamp) {
+      bySlug.set(submission.titleSlug, submission);
+    }
+  }
+
+  return [...bySlug.values()].sort((a, b) => a.timestamp - b.timestamp);
+}
+
+/**
  * Gets the start (Monday) and end (Sunday) of the current week in the given
  * timezone, plus the formatted date strings used for cache/store keys.
  * @param {string} timezone - IANA timezone string or 'auto'

@@ -1,18 +1,9 @@
 import cache, { TTL } from '../utils/cache.js';
+import { gqlRequest } from '../utils/gqlClient.js';
 
 const getUserProblemStats = async (username) => {
-    // Check cache first
-    const cacheKey = `user_stats_${username}`;
-    const cachedData = await cache.get(cacheKey);
-
-    if (cachedData !== null) {
-        console.log(`Cache hit for user stats: ${username}`);
-        return cachedData;
-    }
-
-    console.log(`Cache miss for user stats: ${username}, fetching from API`);
-
-    const query = `
+    return cache.remember(`user_stats_${username}`, TTL.USER_STATS, async () => {
+        const query = `
     query getUserProfile($username: String!) {
         matchedUser(username: $username) {
             submitStats {
@@ -25,30 +16,16 @@ const getUserProblemStats = async (username) => {
         }
     }`;
 
-    const variables = {
-        username
-    };
+        const variables = {
+            username
+        };
 
-    const response = await fetch('https://leetcode.com/graphql', {
-        method: 'POST',
-        headers: {
-            'Content-Type': 'application/json',
-        //   'Authorization': 'Bearer YOUR_API_TOKEN' // Add your authentication token if required
-        },
-        body: JSON.stringify({ query, variables })
+        const data = await gqlRequest(query, variables);
+
+        data.data.matchedUser.submitStats.username = username;
+
+        return data.data.matchedUser.submitStats;
     });
-
-    const data = await response.json();
-
-    data.data.matchedUser.submitStats.username = username;
-    // add profile pic here?
-
-    const statsData = data.data.matchedUser.submitStats;
-
-    // Cache the result with 2-hour TTL
-    await cache.set(cacheKey, statsData, TTL.USER_STATS);
-
-    return statsData;
 };
 
 export default getUserProblemStats;

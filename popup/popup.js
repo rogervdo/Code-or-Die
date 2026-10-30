@@ -9,10 +9,12 @@ import { getTodayInTimezone } from '../utils/timezoneHelper.js';
 import { createUpdateTimer, resetRefreshSchedule, startRefreshCycle } from '../utils/updateTimer.js';
 import {
   accumulateWeeklySubmissions,
+  dedupeProblemsBySlug,
   filterSubmissionsInWeek,
   getCurrentWeekBounds,
   getPointsForDifficulty,
 } from '../utils/contestUtils.js';
+import { loadSolvedDeltas } from '../utils/solvedSnapshots.js';
 import {
   displayACSubmissions,
   displayActivityHeatmap,
@@ -25,6 +27,7 @@ import {
 } from './display.js';
 import { loadStrikesUsersData } from '../utils/streakUtils.js';
 import { showAllSkeletons } from './skeleton.js';
+import { mapLimit } from '../utils/concurrency.js';
 
 // Countdown elements shown on each tab, plus the single cycle that drives them.
 const TIMER_CONTAINERS = ['activity', 'leaderboard', 'contest', 'global-rankings', 'strikes'];
@@ -196,11 +199,13 @@ const LEGACY_STREAK_CORRECTIONS = {
 /**
  * Initialize previousStreaks with legacy corrections if needed
  * This runs once when the extension loads after the update
- * Calculates forward from the reference date to account for late updates
+ * Calculates forward from the reference date to account for late updates.
+ * Also writes previousStreakDates, so the corrected streak is trusted by the
+ * date-anchored repair in computeStreakState instead of being overwritten.
  */
 async function initializeLegacyStreaks() {
   return new Promise((resolve) => {
-    chrome.storage.local.get(['previousStreaks', 'legacyStreaksApplied', 'timezone'], async (result) => {
+    chrome.storage.local.get(['previousStreaks', 'previousStreakDates', 'legacyStreaksApplied', 'timezone'], async (result) => {
       // Only apply legacy corrections if they haven't been applied yet
       if (result.legacyStreaksApplied) {
         console.log('[Legacy Streaks] Already applied, skipping');
@@ -209,6 +214,7 @@ async function initializeLegacyStreaks() {
       }
 
       const currentStreaks = result.previousStreaks || {};
+      const currentStreakDates = result.previousStreakDates || {};
       const dailyActivityLog = result.dailyActivityLog || {};
       const timezone = result.timezone || 'America/Chicago';
       let updated = false;
@@ -237,6 +243,7 @@ async function initializeLegacyStreaks() {
           if (daysPassed === 0) {
             // Same day as reference, use base streak
             currentStreaks[username] = baseStreak;
+            currentStreakDates[username] = asOfDate;
             console.log(`[Legacy Streaks] ${username}: Set to ${baseStreak} (reference day)`);
 
             // Backfill activity log for reference date
@@ -279,6 +286,9 @@ async function initializeLegacyStreaks() {
 
             const finalStreak = baseStreak + additionalDays;
             currentStreaks[username] = finalStreak;
+            // The corrected streak counts through the newest day it found
+            // activity on, so a break after it invalidates the correction.
+            currentStreakDates[username] = activeDates[activeDates.length - 1];
             console.log(
               `[Legacy Streaks] ${username}: Calculated ${finalStreak} (base ${baseStreak} + ${additionalDays} additional days)`
             );
@@ -300,6 +310,7 @@ async function initializeLegacyStreaks() {
         // Save updated streaks, activity log, and mark legacy corrections as applied
         const dataToSave = {
           previousStreaks: currentStreaks,
+          previousStreakDates: currentStreakDates,
           legacyStreaksApplied: true,
         };
 
@@ -402,7 +413,8 @@ document.getElementById('submit-username').addEventListener('click', async () =>
           });
 
           const leaderboardTabs = document.querySelectorAll('.leaderboard-tab');
-          Promise.all(leaderboardData).then((friendData) => {
+          Promise.all(leaderboardData).then(async (friendData) => {
+            const solvedDeltas = await loadSolvedDeltas(friendData, timezone);
             leaderboardTabs.forEach((tab) => {
               tab.addEventListener('click', () => {
                 // once tab is clicked, change active and display new leaderboard data
@@ -410,13 +422,13 @@ document.getElementById('submit-username').addEventListener('click', async () =>
                 tab.classList.add('active');
                 let difficulty = tab.getAttribute('data-difficulty');
                 const diffMap = { All: 0, Easy: 1, Medium: 2, Hard: 3, Weekly: 4 };
-                displayLeaderboard(friendData, getWeeklyLeaderboardData(), username, diffMap[difficulty]);
+                displayLeaderboard(friendData, getWeeklyLeaderboardData(), username, diffMap[difficulty], solvedDeltas);
               });
             });
             // load default tab as All for leaderboard
             const defaultTab = document.querySelector('.leaderboard-tab[data-difficulty="All"]');
             defaultTab.classList.add('active');
-            displayLeaderboard(friendData, null, username, 0);
+            displayLeaderboard(friendData, null, username, 0, solvedDeltas);
           });
         });
       });
@@ -479,7 +491,7 @@ document.addEventListener('DOMContentLoaded', async function () {
 
         // Load in AC data for activity page - CHANGE LIMIT BASED ON FRIENDS LIST
         // need to do this so promises resolve before updating in forEach
-        Promise.all(result.friends.map((friend) => getACSubmissions(friend, 5))).then((friendData) => {
+        mapLimit(result.friends, 4, (friend) => getACSubmissions(friend, 5)).then((friendData) => {
           friendData.forEach((submissions) => {
             allSubmissions = allSubmissions.concat(submissions);
           });
@@ -498,63 +510,71 @@ document.addEventListener('DOMContentLoaded', async function () {
           document.getElementById('max-strikes-input').value = maxStrikes;
           document.getElementById('timezone-select').value = strikesResult.timezone;
           document.getElementById('strikes-streaks-select').value = strikesResult.strikesStreaksView;
-          const { strikesUsers, clearedStrikesUsers, streaksUsers } = await loadStrikesUsersData(
-            result.friends,
-            currUsername,
-            maxStrikes,
-            timezone
-          );
-          cachedStrikesData = strikesUsers;
-          cachedClearedStrikesData = clearedStrikesUsers;
-          cachedStreaksData = streaksUsers;
-          displayStrikesUsers(strikesUsers, clearedStrikesUsers, streaksUsers, currUsername, cachedStrikesStreaksView);
 
-          // Load contest data
-          const contestResult = await loadContestData(result.friends, currUsername, timezone);
-          cachedContestData = contestResult.contestData;
-          displayContestLeaderboard(
-            contestResult.contestData,
-            contestResult.weekStart,
-            contestResult.weekEnd,
-            currUsername
-          );
-
-          cachedGlobalRankingsData = await loadGlobalRankingsData(result.friends, currUsername, timezone);
-          displayGlobalRankings(cachedGlobalRankingsData, currUsername);
+          // The remaining tabs are independent — load them concurrently.
+          await Promise.all([
+            (async () => {
+              const { strikesUsers, clearedStrikesUsers, streaksUsers } = await loadStrikesUsersData(
+                result.friends,
+                currUsername,
+                maxStrikes,
+                timezone
+              );
+              cachedStrikesData = strikesUsers;
+              cachedClearedStrikesData = clearedStrikesUsers;
+              cachedStreaksData = streaksUsers;
+              displayStrikesUsers(strikesUsers, clearedStrikesUsers, streaksUsers, currUsername, cachedStrikesStreaksView);
+            })(),
+            (async () => {
+              const contestResult = await loadContestData(result.friends, currUsername, timezone);
+              cachedContestData = contestResult.contestData;
+              displayContestLeaderboard(
+                contestResult.contestData,
+                contestResult.weekStart,
+                contestResult.weekEnd,
+                currUsername
+              );
+            })(),
+            (async () => {
+              cachedGlobalRankingsData = await loadGlobalRankingsData(result.friends, currUsername, timezone);
+              displayGlobalRankings(cachedGlobalRankingsData, currUsername);
+            })(),
+          ]);
         });
 
         // Load in friend leaderboard data
         let leaderboardData = await getUserProblemStats(currUsername);
-        Promise.all(result.friends.map((friend) => getUserProblemStats(friend))).then((friendData) => {
-          // fetch profile pics for each user
-
+        mapLimit(result.friends, 4, (friend) => getUserProblemStats(friend)).then(async (friendData) => {
           // for each tab listen for click
           const leaderboardTabs = document.querySelectorAll('.leaderboard-tab');
           friendData.push(leaderboardData);
 
           // Fetch all profile pics
-          friendData = friendData.map(async (stat) => {
+          const friendDataResolved = await mapLimit(friendData, 4, async (stat) => {
             const userData = await getUserProfilePic(stat.username);
             const avatar = userData.userAvatar;
             return { ...stat, avatar };
           });
 
-          Promise.all(friendData).then((friendData) => {
-            leaderboardTabs.forEach((tab) => {
-              tab.addEventListener('click', () => {
-                // once tab is clicked, change active and display new leaderboard data
-                leaderboardTabs.forEach((t) => t.classList.remove('active'));
-                tab.classList.add('active');
-                let difficulty = tab.getAttribute('data-difficulty');
-                const diffMap = { All: 0, Easy: 1, Medium: 2, Hard: 3, Weekly: 4 };
-                displayLeaderboard(friendData, getWeeklyLeaderboardData(), currUsername, diffMap[difficulty]);
-              });
+          const { timezone } = await new Promise((resolve) =>
+            chrome.storage.local.get({ timezone: 'America/Chicago' }, resolve)
+          );
+          const solvedDeltas = await loadSolvedDeltas(friendDataResolved, timezone);
+
+          leaderboardTabs.forEach((tab) => {
+            tab.addEventListener('click', () => {
+              // once tab is clicked, change active and display new leaderboard data
+              leaderboardTabs.forEach((t) => t.classList.remove('active'));
+              tab.classList.add('active');
+              let difficulty = tab.getAttribute('data-difficulty');
+              const diffMap = { All: 0, Easy: 1, Medium: 2, Hard: 3, Weekly: 4 };
+              displayLeaderboard(friendDataResolved, getWeeklyLeaderboardData(), currUsername, diffMap[difficulty], solvedDeltas);
             });
-            // load default tab as All for leaderboard
-            const defaultTab = document.querySelector('.leaderboard-tab[data-difficulty="All"]');
-            defaultTab.classList.add('active');
-            displayLeaderboard(friendData, null, currUsername, 0);
           });
+          // load default tab as All for leaderboard
+          const defaultTab = document.querySelector('.leaderboard-tab[data-difficulty="All"]');
+          defaultTab.classList.add('active');
+          displayLeaderboard(friendDataResolved, null, currUsername, 0, solvedDeltas);
         });
       });
     }
@@ -612,38 +632,54 @@ async function loadContestData(friends, username, timezone = 'America/Chicago') 
   // and merge each batch into a per-user weekly store. This accumulates
   // submissions across refreshes and captures more than the 20 most recent
   // when a user has been highly active.
-  for (const user of allUsers) {
+  // Fetch each user's submissions + avatar in bounded parallel; accumulate
+  // (a per-user storage write) sequentially below to keep it race-free.
+  const userDataList = await mapLimit(allUsers, 4, async (user) => {
     const submissions = await getACSubmissions(user, 20);
     const userData = await getUserProfilePic(user);
+    return { user, submissions, avatar: userData.userAvatar };
+  });
 
+  for (const { user, submissions, avatar } of userDataList) {
     // Filter to the current week before accumulating so the store stays bounded
     const recentWeekSubmissions = filterSubmissionsInWeek(submissions, weekStart, weekEnd, timezone);
     const weekSubmissions = await accumulateWeeklySubmissions(user, weekStartFormatted, recentWeekSubmissions);
 
-    // Calculate points for each submission
+    // Score distinct problems: re-solving a problem during the week doesn't
+    // earn a second time.
+    const weekProblems = dedupeProblemsBySlug(weekSubmissions);
+
+    // Calculate points for each problem
     let totalPoints = 0;
-    const problemsWithDifficulty = await Promise.all(
-      weekSubmissions.map(async (submission) => {
-        const problemData = await questionDifficulty(submission.titleSlug);
-        const difficulty = problemData.difficulty;
-        const points = getPointsForDifficulty(difficulty);
+    const problemsWithDifficulty = await mapLimit(weekProblems, 6, async (problem) => {
+      const problemData = await questionDifficulty(problem.titleSlug);
+      const difficulty = problemData?.difficulty ?? null;
+      const points = getPointsForDifficulty(difficulty);
 
-        totalPoints += points;
+      totalPoints += points;
 
-        return { ...submission, difficulty, points };
-      })
-    );
+      return { ...problem, difficulty, points };
+    });
 
     contestData.push({
       username: user,
-      avatar: userData.userAvatar,
+      avatar,
       points: totalPoints,
       submissions: problemsWithDifficulty,
     });
   }
 
-  // Sort by points descending
-  contestData.sort((a, b) => b.points - a.points);
+  // Rank by points, then by problems solved, then case-insensitively by name so
+  // ties are deterministic instead of falling back to a case-sensitive sort.
+  contestData.sort((a, b) => {
+    if (b.points !== a.points) {
+      return b.points - a.points;
+    }
+    if (b.submissions.length !== a.submissions.length) {
+      return b.submissions.length - a.submissions.length;
+    }
+    return a.username.localeCompare(b.username, undefined, { sensitivity: 'base' });
+  });
 
   const result = {
     contestData,
@@ -704,7 +740,7 @@ async function loadGlobalRankingsData(friends, username, timezone = 'America/Chi
   });
   const problemRankSnapshots = storageResult.problemRankSnapshots || { lastViewed: {}, byDate: {} };
 
-  const rankingsPromises = allUsers.map(async (user) => {
+  const rankingsData = await mapLimit(allUsers, 4, async (user) => {
     const rankingData = await getGlobalRanking(user);
     const userData = await getUserProfilePic(user);
 
@@ -733,8 +769,6 @@ async function loadGlobalRankingsData(friends, username, timezone = 'America/Chi
       changeReferenceDate,
     };
   });
-
-  const rankingsData = await Promise.all(rankingsPromises);
 
   if (!updateSnapshots) {
     return rankingsData;
@@ -987,6 +1021,8 @@ async function reloadAllData({ force = false } = {}) {
 
   if (force) {
     for (const user of allUsers) {
+      await cache.delete(`submissions_${user}`);
+      // Legacy limit-scoped keys, from before submissions were consolidated.
       await cache.delete(`submissions_${user}_5`);
       await cache.delete(`submissions_${user}_20`);
       await cache.delete(`submissions_${user}_30`);
@@ -994,6 +1030,9 @@ async function reloadAllData({ force = false } = {}) {
       await cache.delete(`user_stats_${user}`);
       await cache.delete(`problem_ranking_${user}`);
       await cache.delete(`user_calendar_${user}`);
+      // Avatars have a long TTL, so clear them here too — Refresh All is the
+      // manual escape hatch for a changed profile picture.
+      await cache.delete(`profile_pic_${user}`);
     }
 
     const { weekStart } = getCurrentWeekBounds(timezone);
@@ -1008,7 +1047,7 @@ async function reloadAllData({ force = false } = {}) {
   // Activity
   currentUsername = username;
   let allSubmissions = [await getACSubmissions(username, 5)];
-  const friendSubmissions = await Promise.all(friends.map((friend) => getACSubmissions(friend, 5)));
+  const friendSubmissions = await mapLimit(friends, 4, (friend) => getACSubmissions(friend, 5));
   friendSubmissions.forEach((submissions) => {
     allSubmissions = allSubmissions.concat(submissions);
   });
@@ -1016,61 +1055,68 @@ async function reloadAllData({ force = false } = {}) {
   displayACSubmissions(allSubmissions, username);
   loadSelfSummary(username);
 
-  // Contest (loaded before the leaderboard so the Weekly view can reuse it)
-  const contestResult = await loadContestData(friends, username, timezone);
-  cachedContestData = contestResult.contestData;
-  displayContestLeaderboard(contestResult.contestData, contestResult.weekStart, contestResult.weekEnd, username);
+  // The remaining tabs are independent, so run them concurrently. Contest still
+  // feeds the leaderboard's Weekly view, so those two stay ordered with respect
+  // to each other.
+  const contestAndLeaderboard = (async () => {
+    const contestResult = await loadContestData(friends, username, timezone);
+    cachedContestData = contestResult.contestData;
+    displayContestLeaderboard(contestResult.contestData, contestResult.weekStart, contestResult.weekEnd, username);
 
-  // Leaderboard
-  const leaderboardData = await getUserProblemStats(username);
-  const leaderboardFriendData = await Promise.all(friends.map((friend) => getUserProblemStats(friend)));
-  leaderboardFriendData.push(leaderboardData);
+    const leaderboardData = await getUserProblemStats(username);
+    const leaderboardFriendData = await mapLimit(friends, 4, (friend) => getUserProblemStats(friend));
+    leaderboardFriendData.push(leaderboardData);
 
-  const friendDataResolved = await Promise.all(
-    leaderboardFriendData.map(async (stat) => {
+    const friendDataResolved = await mapLimit(leaderboardFriendData, 4, async (stat) => {
       const userData = await getUserProfilePic(stat.username);
       return { ...stat, avatar: userData.userAvatar };
-    })
-  );
-
-  // Rebind the leaderboard tabs after their rows are re-rendered
-  document.querySelectorAll('.leaderboard-tab').forEach((tab) => {
-    const newTab = tab.cloneNode(true);
-    tab.parentNode.replaceChild(newTab, tab);
-  });
-
-  document.querySelectorAll('.leaderboard-tab').forEach((tab) => {
-    tab.addEventListener('click', () => {
-      document.querySelectorAll('.leaderboard-tab').forEach((t) => t.classList.remove('active'));
-      tab.classList.add('active');
-      const difficulty = tab.getAttribute('data-difficulty');
-      const diffMap = { All: 0, Easy: 1, Medium: 2, Hard: 3, Weekly: 4 };
-      displayLeaderboard(friendDataResolved, getWeeklyLeaderboardData(), username, diffMap[difficulty]);
     });
-  });
 
-  const activeTab = document.querySelector('.leaderboard-tab.active');
-  const difficulty = activeTab ? activeTab.getAttribute('data-difficulty') : 'All';
-  const diffMap = { All: 0, Easy: 1, Medium: 2, Hard: 3, Weekly: 4 };
-  displayLeaderboard(friendDataResolved, getWeeklyLeaderboardData(), username, diffMap[difficulty]);
+    const solvedDeltas = await loadSolvedDeltas(friendDataResolved, timezone);
 
-  // Strikes
-  const { strikesUsers, clearedStrikesUsers, streaksUsers } = await loadStrikesUsersData(
-    friends,
-    username,
-    maxStrikes,
-    timezone
-  );
-  cachedStrikesData = strikesUsers;
-  cachedClearedStrikesData = clearedStrikesUsers;
-  cachedStreaksData = streaksUsers;
-  displayStrikesUsers(strikesUsers, clearedStrikesUsers, streaksUsers, username, cachedStrikesStreaksView);
+    // Rebind the leaderboard tabs after their rows are re-rendered
+    document.querySelectorAll('.leaderboard-tab').forEach((tab) => {
+      const newTab = tab.cloneNode(true);
+      tab.parentNode.replaceChild(newTab, tab);
+    });
 
-  // Global rankings
-  cachedGlobalRankingsData = await loadGlobalRankingsData(friends, username, timezone, {
-    updateSnapshots: false,
-  });
-  displayGlobalRankings(cachedGlobalRankingsData, username);
+    document.querySelectorAll('.leaderboard-tab').forEach((tab) => {
+      tab.addEventListener('click', () => {
+        document.querySelectorAll('.leaderboard-tab').forEach((t) => t.classList.remove('active'));
+        tab.classList.add('active');
+        const difficulty = tab.getAttribute('data-difficulty');
+        const diffMap = { All: 0, Easy: 1, Medium: 2, Hard: 3, Weekly: 4 };
+        displayLeaderboard(friendDataResolved, getWeeklyLeaderboardData(), username, diffMap[difficulty], solvedDeltas);
+      });
+    });
+
+    const activeTab = document.querySelector('.leaderboard-tab.active');
+    const difficulty = activeTab ? activeTab.getAttribute('data-difficulty') : 'All';
+    const diffMap = { All: 0, Easy: 1, Medium: 2, Hard: 3, Weekly: 4 };
+    displayLeaderboard(friendDataResolved, getWeeklyLeaderboardData(), username, diffMap[difficulty], solvedDeltas);
+  })();
+
+  const strikesSection = (async () => {
+    const { strikesUsers, clearedStrikesUsers, streaksUsers } = await loadStrikesUsersData(
+      friends,
+      username,
+      maxStrikes,
+      timezone
+    );
+    cachedStrikesData = strikesUsers;
+    cachedClearedStrikesData = clearedStrikesUsers;
+    cachedStreaksData = streaksUsers;
+    displayStrikesUsers(strikesUsers, clearedStrikesUsers, streaksUsers, username, cachedStrikesStreaksView);
+  })();
+
+  const rankingsSection = (async () => {
+    cachedGlobalRankingsData = await loadGlobalRankingsData(friends, username, timezone, {
+      updateSnapshots: false,
+    });
+    displayGlobalRankings(cachedGlobalRankingsData, username);
+  })();
+
+  await Promise.all([contestAndLeaderboard, strikesSection, rankingsSection]);
 }
 
 /**
@@ -1229,6 +1275,8 @@ async function loadSelfSummary(username) {
     displayActivityHeatmap(calendar);
   } catch (error) {
     console.error('Failed to load user summary:', error);
+    displaySolvedStats(null);
+    displayActivityHeatmap(null);
   }
 }
 
