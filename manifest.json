@@ -1,7 +1,7 @@
 {
   "name": "Leetcode or Die",
   "description": "An extension to view the activity of your friends on LeetCode.",
-  "version": "1.7.0",
+  "version": "1.8.0",
   "manifest_version": 3,
   "browser_specific_settings": {
     "gecko": {
